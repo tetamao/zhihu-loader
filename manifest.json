@@ -1,0 +1,11 @@
+{
+	"id": "zhihu-loader",
+	"name": "zhihu-loader",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "A plugin to load Zhihu answers into Obsidian.",
+	"author": "HuaG",
+	"authorUrl": "https://obsidian.md",
+	"fundingUrl": "https://obsidian.md/pricing",
+	"isDesktopOnly": false
+}
