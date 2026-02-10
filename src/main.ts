@@ -28,12 +28,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// 1. 侧边栏核心按钮：一键同步所有回答
 		this.addRibbonIcon("refresh-cw", "一键同步我的所有回答", () =>
 			this.syncAllMyAnswers(),
 		);
 
-		// 2. 备用按钮：导入单个回答
 		this.addRibbonIcon("link", "导入单个回答", () =>
 			this.showImportModal(),
 		);
@@ -41,7 +39,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
-	// --- 核心：全量一键同步逻辑 ---
 	async syncAllMyAnswers() {
 		const userId = this.settings.zhihuId;
 		if (!userId) {
@@ -51,8 +48,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 		new Notice("🔍 正在连接知乎，调取你的回答列表...");
 		try {
-			// 这里 limit=20 可以根据需要调大，知乎 API 单次支持到 20
-			const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=0&limit=20`;
+			// 增加 include 参数以确保能拿到话题数据供元数据使用
+			const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=0&limit=20&include=data%5B*%5D.target.question.topics`;
 			const res = await requestUrl({
 				url: url,
 				method: "GET",
@@ -69,7 +66,9 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				return;
 			}
 
-			new Notice(`🚀 发现 ${items.length} 个回答，开始全量高清同步...`);
+			new Notice(
+				`🚀 发现 ${items.length} 个回答，开始同步至 answers 文件夹...`,
+			);
 
 			let successCount = 0;
 			for (const item of items) {
@@ -81,21 +80,20 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					console.error(`同步失败: ${answerUrl}`, err);
 				}
 			}
-			new Notice(`✅ 任务完成！共一键同步了 ${successCount} 个回答`);
+			new Notice(`✅ 任务完成！共同步了 ${successCount} 个回答`);
 		} catch (e) {
 			console.error(e);
 			new Notice("❌ 同步中断！请检查网络或 Cookie 权限");
 		}
 	}
 
-	// --- 核心：单条回答抓取逻辑 (包含高清、去重、所有元数据) ---
 	async fetchZhihuAnswer(cleanUrl: string) {
 		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
 		if (!answerId) return;
 
 		try {
 			const response = await requestUrl({
-				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question,voteup_count,comment_count,thanks_count,created_time,updated_time`,
+				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question,voteup_count,comment_count,created_time,updated_time,question.topics`,
 				method: "GET",
 				headers: {
 					"User-Agent":
@@ -108,10 +106,16 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const data = response.json;
 			const apiTitle = data.question.title;
 			const vault = this.app.vault;
-			const assetFolder = `${this.settings.downloadFolder}/attachments`;
 
-			if (!(await vault.adapter.exists(this.settings.downloadFolder)))
-				await vault.createFolder(this.settings.downloadFolder);
+			// --- 路径逻辑：固定为 answers 和 attachments ---
+			const baseFolder = this.settings.downloadFolder;
+			const answerFolder = `${baseFolder}/answers`;
+			const assetFolder = `${baseFolder}/attachments`;
+
+			if (!(await vault.adapter.exists(baseFolder)))
+				await vault.createFolder(baseFolder);
+			if (!(await vault.adapter.exists(answerFolder)))
+				await vault.createFolder(answerFolder);
 			if (!(await vault.adapter.exists(assetFolder)))
 				await vault.createFolder(assetFolder);
 
@@ -131,7 +135,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					continue;
 				}
 
-				// 终极无水印还原：截断所有参数
 				let hdSrc = rawSrc
 					.split("?")[0]
 					.replace(/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi, "$1");
@@ -180,23 +183,24 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			);
 			const markdownBody = turndownService.turndown(doc.body.innerHTML);
 
-			// 找回所有元数据：标题、URL、作者、点赞、评论、日期
+			// 提取话题用于元数据
+			const topics = data.question.topics?.map((t: any) => t.name) || [];
+
 			const fileContent = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`作者: ${data.author.name}`,
+				`话题: ${topics.join(", ")}`,
 				`点赞数: ${data.voteup_count}`,
-				`评论数: ${data.comment_count}`,
 				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
-				`最后更新: ${new Date(data.updated_time * 1000).toISOString().split("T")[0]}`,
 				`导入日期: ${new Date().toISOString().split("T")[0]}`,
 				`---`,
 				`# ${apiTitle}\n\n${markdownBody}`,
 			].join("\n");
 
 			const safeFileName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
-			const filePath = `${this.settings.downloadFolder}/${safeFileName}.md`;
+			const filePath = `${answerFolder}/${safeFileName}.md`;
 
 			const existingFile = vault.getAbstractFileByPath(filePath);
 			if (existingFile instanceof TFile) {
@@ -237,12 +241,14 @@ class ZhihuSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+
 		new Setting(containerEl).setName("知乎 Cookie").addTextArea((t) =>
 			t.setValue(this.plugin.settings.cookie).onChange(async (v) => {
 				this.plugin.settings.cookie = v;
 				await this.plugin.saveSettings();
 			}),
 		);
+
 		new Setting(containerEl)
 			.setName("我的 ID (People ID)")
 			.setDesc("主页 URL 中 people/ 后面那一串")
@@ -252,7 +258,8 @@ class ZhihuSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}),
 			);
-		new Setting(containerEl).setName("保存文件夹").addText((t) =>
+
+		new Setting(containerEl).setName("根目录名称").addText((t) =>
 			t
 				.setValue(this.plugin.settings.downloadFolder)
 				.onChange(async (v) => {
