@@ -1,147 +1,260 @@
-import { App, Modal, Notice, Plugin, Setting, requestUrl, TFile } from 'obsidian';
-import TurndownService from 'turndown';
+import {
+	App,
+	Modal,
+	Notice,
+	Plugin,
+	PluginSettingTab,
+	Setting,
+	requestUrl,
+	TFile,
+} from "obsidian";
+import TurndownService from "turndown";
+
+interface ZhihuSettings {
+	userId: string;
+	downloadFolder: string;
+	cookie: string;
+}
+
+const DEFAULT_SETTINGS: ZhihuSettings = {
+	userId: "",
+	downloadFolder: "Zhihu_Imports",
+	cookie: "",
+};
 
 export default class ZhihuLoaderPlugin extends Plugin {
-    async onload() {
-        console.log('知乎导入插件已加载');
+	settings: ZhihuSettings;
 
-        this.addRibbonIcon('link', '导入知乎回答', (evt: MouseEvent) => {
-            this.showImportModal();
-        });
+	async onload() {
+		await this.loadSettings();
+		this.addRibbonIcon("link", "知乎终极导入", () =>
+			this.showImportModal(),
+		);
+		this.addSettingTab(new ZhihuSettingTab(this.app, this));
+	}
 
-        this.addCommand({
-            id: 'import-zhihu-answer',
-            name: '导入知乎回答',
-            callback: () => {
-                this.showImportModal();
-            }
-        });
-    }
+	showImportModal() {
+		const modal = new ImportModal(this.app, async (url) => {
+			if (url) await this.fetchZhihuAnswer(url);
+		});
+		modal.open();
+	}
 
-    showImportModal() {
-        const modal = new ImportModal(this.app, async (url) => {
-            if (url) {
-                new Notice('正在抓取并处理图片...');
-                await this.fetchZhihuAnswer(url);
-            }
-        });
-        modal.open();
-    }
+	async fetchZhihuAnswer(rawInput: string) {
+		// 1. 提取 URL
+		const urlMatch = rawInput.match(
+			/https?:\/\/www\.zhihu\.com\/question\/\d+\/answer\/\d+/,
+		);
+		if (!urlMatch) {
+			new Notice("❌ 链接识别失败");
+			return;
+		}
+		const cleanUrl = urlMatch[0];
+		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1] || "unknown";
 
-    async fetchZhihuAnswer(url: string) {
-    const match = url.match(/answer\/(\d+)/);
-    if (!match) {
-        new Notice('无效的知乎回答链接');
-        return;
-    }
-    const answerId = match[1];
+		try {
+			new Notice("🚀 正在深度抓取元数据与原图...");
 
-    try {
-        const response = await requestUrl({
-            url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question`,
-            method: 'GET',
-        });
+			// 2. 获取 API 数据（包含所有社交字段）
+			const response = await requestUrl({
+				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question,voteup_count,comment_count,thanks_count,created_time,updated_time`,
+				method: "GET",
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+					Cookie: this.settings.cookie,
+					Referer: "https://www.zhihu.com/",
+				},
+			});
 
-        const data = response.json;
-        const title = data.question.title;
-        
-        // --- 1. 强力创建文件夹 ---
-        const baseFolder = "Zhihu_Imports";
-        const assetFolder = `${baseFolder}/attachments`;
-        
-        const vault = this.app.vault;
-        if (!(await vault.adapter.exists(baseFolder))) await vault.createFolder(baseFolder);
-        if (!(await vault.adapter.exists(assetFolder))) await vault.createFolder(assetFolder);
+			const data = response.json;
+			const apiTitle = data.question.title;
 
-        // --- 2. 预处理 HTML (彻底物理删除) ---
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(data.content, 'text/html');
-        
-        // 关键：一次性找出所有图片并分流处理
-        const imgs = Array.from(doc.querySelectorAll('img'));
-        
-        for (let i = 0; i < imgs.length; i++) {
-            const img = imgs[i];
-            const src = img.getAttribute('src') || '';
-            const actualSrc = img.getAttribute('data-actualsrc') || img.getAttribute('data-original');
+			// 3. 准备目录
+			const baseFolder = this.settings.downloadFolder;
+			const assetFolder = `${baseFolder}/attachments`;
+			const vault = this.app.vault;
+			if (!(await vault.adapter.exists(baseFolder)))
+				await vault.createFolder(baseFolder);
+			if (!(await vault.adapter.exists(assetFolder)))
+				await vault.createFolder(assetFolder);
 
-            // 核心逻辑：如果是占位图（src含svg或没有actualSrc），直接从DOM树删除
-            if (src.includes('data:image/svg+xml') || !actualSrc) {
-                img.remove(); 
-                continue;
-            }
+			// 4. 图片高清无水印处理
+			const parser = new DOMParser();
+			const doc = parser.parseFromString(data.content, "text/html");
+			const imgs = Array.from(doc.querySelectorAll("img"));
+			const processedImages = new Set<string>();
+			let imageIndex = 0;
 
-            // 处理真实图片下载
-            try {
-                const imgRes = await requestUrl({ url: actualSrc, method: 'GET' });
-                const ext = actualSrc.contains('webp') ? 'webp' : (actualSrc.contains('png') ? 'png' : 'jpg');
-                const imgName = `zhihu_${answerId}_${i}.${ext}`;
-                const imgPath = `${assetFolder}/${imgName}`;
+			for (const img of imgs) {
+				let rawSrc =
+					img.getAttribute("data-actualsrc") ||
+					img.getAttribute("data-original") ||
+					img.getAttribute("src");
+				if (
+					!rawSrc ||
+					rawSrc.includes("data:image/svg+xml") ||
+					rawSrc.includes("equation")
+				) {
+					img.remove();
+					continue;
+				}
 
-                if (!(await vault.adapter.exists(imgPath))) {
-                    await vault.createBinary(imgPath, imgRes.arrayBuffer);
-                }
-                
-                // 将 DOM 中的 src 替换为文件名，供 Turndown 使用
-                img.setAttribute('src', imgName);
-            } catch (e) {
-                console.error("图片下载失败:", actualSrc);
-            }
-        }
+				// --- 🔥 彻底去水印逻辑 ---
+				// 第一步：截断问号后面的所有参数（彻底干掉 ?source=...）
+				let hdSrc = rawSrc.split("?")[0];
+				// 第二步：正则匹配并粉碎所有尺寸后缀，还原为原始扩展名
+				hdSrc = hdSrc.replace(
+					/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi,
+					"$1",
+				);
 
-        // --- 3. 转换 Markdown ---
-        const turndownService = new TurndownService({
-            headingStyle: 'atx',
-            bulletListMarker: '-'
-        });
+				const imageId = hdSrc.split("/").pop() || hdSrc;
 
-        // 强制拦截 img 标签，转为 Obsidian 内部链接
-        turndownService.addRule('zhihu-img-fix', {
-            filter: 'img',
-            replacement: (content, node: any) => {
-                const src = node.getAttribute('src');
-                if (src && !src.startsWith('http')) {
-                    return `![[${src}]]`; // 本地化成功
-                }
-                return ""; // 任何未处理成功的（包括svg）全部变为空字符串
-            }
-        });
+				if (processedImages.has(imageId)) {
+					// 如果重复，重指向已有的本地文件索引
+					const existingIdx =
+						Array.from(processedImages).indexOf(imageId);
+					const ext = hdSrc.split(".").pop() || "jpg";
+					img.setAttribute(
+						"src",
+						`zhihu_${answerId}_${existingIdx}.${ext}`,
+					);
+					continue;
+				}
 
-        const markdownContent = turndownService.turndown(doc.body.innerHTML);
+				try {
+					const imgRes = await requestUrl({
+						url: hdSrc,
+						method: "GET",
+					});
+					const ext = hdSrc.split(".").pop() || "jpg";
+					const imgName = `zhihu_${answerId}_${imageIndex}.${ext}`;
+					const imgPath = `${assetFolder}/${imgName}`;
 
-        // --- 4. 保存文件 ---
-        const fileContent = `---\nsource: ${url}\nauthor: ${data.author.name}\ndate: ${new Date().toISOString().split('T')[0]}\n---\n# ${title}\n\n${markdownContent}`;
-        const safeTitle = title.replace(/[\\/:*?"<>|]/g, '-');
-        const filePath = `${baseFolder}/${safeTitle}_${answerId}.md`;
+					if (!(await vault.adapter.exists(imgPath))) {
+						await vault.createBinary(imgPath, imgRes.arrayBuffer);
+					}
+					img.setAttribute("src", imgName);
+					processedImages.add(imageId);
+					imageIndex++;
+				} catch (e) {
+					console.error("高清下载失败:", hdSrc);
+				}
+			}
 
-        const existingFile = vault.getAbstractFileByPath(filePath);
-        if (existingFile instanceof TFile) {
-            await vault.modify(existingFile, fileContent);
-        } else {
-            await vault.create(filePath, fileContent);
-        }
-        
-        new Notice('✅ 导入完成，请检查附件文件夹');
+			// 5. 转换 Markdown 并清理
+			const turndownService = new TurndownService({
+				headingStyle: "atx",
+				bulletListMarker: "-",
+			});
+			turndownService.addRule("zhihu-img", {
+				filter: "img",
+				replacement: (content, node: any) => {
+					const src = node.getAttribute("src");
+					return src && !src.startsWith("http") ? `![[${src}]]` : "";
+				},
+			});
+			doc.querySelectorAll("noscript, script, style").forEach((el) =>
+				el.remove(),
+			);
+			const markdownBody = turndownService.turndown(doc.body.innerHTML);
 
-    } catch (error) {
-        console.error("插件报错:", error);
-        new Notice('❌ 抓取失败，请看控制台报错');
-    }
+			// --- 6. 找回所有细节元数据 ---
+			const fileContent = [
+				`---`,
+				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
+				`url: ${cleanUrl}`,
+				`作者: ${data.author.name}`,
+				`点赞数: ${data.voteup_count}`,
+				`评论数: ${data.comment_count}`,
+				`感谢数: ${data.thanks_count}`,
+				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
+				`最后更新: ${new Date(data.updated_time * 1000).toISOString().split("T")[0]}`,
+				`导入日期: ${new Date().toISOString().split("T")[0]}`,
+				`---`,
+				`# ${apiTitle}`,
+				``,
+				`${markdownBody}`,
+			].join("\n");
+
+			const safeFileName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
+			const filePath = `${baseFolder}/${safeFileName}.md`;
+
+			const existingFile = vault.getAbstractFileByPath(filePath);
+			if (existingFile instanceof TFile) {
+				await vault.modify(existingFile, fileContent);
+			} else {
+				await vault.create(filePath, fileContent);
+			}
+
+			new Notice(`✅ 细节已全部找回！共处理 ${imageIndex} 张图`);
+		} catch (error) {
+			console.error(error);
+			new Notice("❌ 抓取失败");
+		}
+	}
+
+	async loadSettings() {
+		this.settings = Object.assign(
+			{},
+			DEFAULT_SETTINGS,
+			await this.loadData(),
+		);
+	}
+	async saveSettings() {
+		await this.saveData(this.settings);
+	}
 }
 
-
-}
-
-// ImportModal 类保持不变...
+// Modal 和 SettingTab 保持不变
 class ImportModal extends Modal {
-    url: string;
-    onSubmit: (url: string) => void;
-    constructor(app: App, onSubmit: (url: string) => void) { super(app); this.onSubmit = onSubmit; }
-    onOpen() {
-        const { contentEl } = this;
-        contentEl.createEl('h2', { text: '导入知乎回答' });
-        new Setting(contentEl).setName('链接').addText((text) => text.onChange((v) => this.url = v));
-        new Setting(contentEl).addButton((b) => b.setButtonText('导入').setCta().onClick(() => { this.close(); this.onSubmit(this.url); }));
-    }
-    onClose() { this.contentEl.empty(); }
+	url: string = "";
+	onSubmit: (url: string) => void;
+	constructor(app: App, onSubmit: (url: string) => void) {
+		super(app);
+		this.onSubmit = onSubmit;
+	}
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "导入高清知乎" });
+		new Setting(contentEl)
+			.setName("链接")
+			.addText((text) => text.onChange((v) => (this.url = v)));
+		new Setting(contentEl).addButton((b) =>
+			b
+				.setButtonText("导入")
+				.setCta()
+				.onClick(() => {
+					this.close();
+					this.onSubmit(this.url);
+				}),
+		);
+	}
+}
+
+class ZhihuSettingTab extends PluginSettingTab {
+	plugin: ZhihuLoaderPlugin;
+	constructor(app: App, plugin: ZhihuLoaderPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+		new Setting(containerEl).setName("知乎 Cookie").addTextArea((t) =>
+			t.setValue(this.plugin.settings.cookie).onChange(async (v) => {
+				this.plugin.settings.cookie = v;
+				await this.plugin.saveSettings();
+			}),
+		);
+		new Setting(containerEl).setName("保存文件夹").addText((t) =>
+			t
+				.setValue(this.plugin.settings.downloadFolder)
+				.onChange(async (v) => {
+					this.plugin.settings.downloadFolder = v;
+					await this.plugin.saveSettings();
+				}),
+		);
+	}
 }
