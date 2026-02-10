@@ -183,15 +183,19 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			);
 			const markdownBody = turndownService.turndown(doc.body.innerHTML);
 
-			// 提取话题用于元数据
-			const topics = data.question.topics?.map((t: any) => t.name) || [];
+			// 提取话题并处理为带引号的双链格式
+			const topics: string[] =
+				data.question.topics?.map((t: any) => t.name) || [];
+
+			// 关键改动：在 [[ ]] 外面加上单引号 ' '
+			const linkedTopics = topics.map((t) => `'[[${t}]]'`).join(", ");
 
 			const fileContent = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`作者: ${data.author.name}`,
-				`话题: ${topics.join(", ")}`,
+				`话题: [${linkedTopics}]`, // 推荐写成数组格式 [ '[[话题1]]', '[[话题2]]' ]
 				`点赞数: ${data.voteup_count}`,
 				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
 				`导入日期: ${new Date().toISOString().split("T")[0]}`,
