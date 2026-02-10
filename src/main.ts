@@ -11,15 +11,15 @@ import {
 import TurndownService from "turndown";
 
 interface ZhihuSettings {
-	userId: string;
 	downloadFolder: string;
 	cookie: string;
+	zhihuId: string;
 }
 
 const DEFAULT_SETTINGS: ZhihuSettings = {
-	userId: "",
 	downloadFolder: "Zhihu_Imports",
 	cookie: "",
+	zhihuId: "",
 };
 
 export default class ZhihuLoaderPlugin extends Plugin {
@@ -27,35 +27,73 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 	async onload() {
 		await this.loadSettings();
-		this.addRibbonIcon("link", "知乎终极导入", () =>
+
+		// 1. 侧边栏核心按钮：一键同步所有回答
+		this.addRibbonIcon("refresh-cw", "一键同步我的所有回答", () =>
+			this.syncAllMyAnswers(),
+		);
+
+		// 2. 备用按钮：导入单个回答
+		this.addRibbonIcon("link", "导入单个回答", () =>
 			this.showImportModal(),
 		);
+
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
-	showImportModal() {
-		const modal = new ImportModal(this.app, async (url) => {
-			if (url) await this.fetchZhihuAnswer(url);
-		});
-		modal.open();
-	}
-
-	async fetchZhihuAnswer(rawInput: string) {
-		// 1. 提取 URL
-		const urlMatch = rawInput.match(
-			/https?:\/\/www\.zhihu\.com\/question\/\d+\/answer\/\d+/,
-		);
-		if (!urlMatch) {
-			new Notice("❌ 链接识别失败");
+	// --- 核心：全量一键同步逻辑 ---
+	async syncAllMyAnswers() {
+		const userId = this.settings.zhihuId;
+		if (!userId) {
+			new Notice("❌ 报错：请先在设置中填写你的用户 ID");
 			return;
 		}
-		const cleanUrl = urlMatch[0];
-		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1] || "unknown";
+
+		new Notice("🔍 正在连接知乎，调取你的回答列表...");
+		try {
+			// 这里 limit=20 可以根据需要调大，知乎 API 单次支持到 20
+			const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=0&limit=20`;
+			const res = await requestUrl({
+				url: url,
+				method: "GET",
+				headers: {
+					Cookie: this.settings.cookie,
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+				},
+			});
+
+			const items = res.json.data;
+			if (!items || items.length === 0) {
+				new Notice("⚠️ 没抓到内容！请检查 ID 或 Cookie 是否失效");
+				return;
+			}
+
+			new Notice(`🚀 发现 ${items.length} 个回答，开始全量高清同步...`);
+
+			let successCount = 0;
+			for (const item of items) {
+				const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
+				try {
+					await this.fetchZhihuAnswer(answerUrl);
+					successCount++;
+				} catch (err) {
+					console.error(`同步失败: ${answerUrl}`, err);
+				}
+			}
+			new Notice(`✅ 任务完成！共一键同步了 ${successCount} 个回答`);
+		} catch (e) {
+			console.error(e);
+			new Notice("❌ 同步中断！请检查网络或 Cookie 权限");
+		}
+	}
+
+	// --- 核心：单条回答抓取逻辑 (包含高清、去重、所有元数据) ---
+	async fetchZhihuAnswer(cleanUrl: string) {
+		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
+		if (!answerId) return;
 
 		try {
-			new Notice("🚀 正在深度抓取元数据与原图...");
-
-			// 2. 获取 API 数据（包含所有社交字段）
 			const response = await requestUrl({
 				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question,voteup_count,comment_count,thanks_count,created_time,updated_time`,
 				method: "GET",
@@ -69,56 +107,41 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			const data = response.json;
 			const apiTitle = data.question.title;
-
-			// 3. 准备目录
-			const baseFolder = this.settings.downloadFolder;
-			const assetFolder = `${baseFolder}/attachments`;
 			const vault = this.app.vault;
-			if (!(await vault.adapter.exists(baseFolder)))
-				await vault.createFolder(baseFolder);
+			const assetFolder = `${this.settings.downloadFolder}/attachments`;
+
+			if (!(await vault.adapter.exists(this.settings.downloadFolder)))
+				await vault.createFolder(this.settings.downloadFolder);
 			if (!(await vault.adapter.exists(assetFolder)))
 				await vault.createFolder(assetFolder);
 
-			// 4. 图片高清无水印处理
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(data.content, "text/html");
-			const imgs = Array.from(doc.querySelectorAll("img"));
 			const processedImages = new Set<string>();
 			let imageIndex = 0;
 
+			const imgs = Array.from(doc.querySelectorAll("img"));
 			for (const img of imgs) {
 				let rawSrc =
 					img.getAttribute("data-actualsrc") ||
 					img.getAttribute("data-original") ||
 					img.getAttribute("src");
-				if (
-					!rawSrc ||
-					rawSrc.includes("data:image/svg+xml") ||
-					rawSrc.includes("equation")
-				) {
+				if (!rawSrc || rawSrc.includes("data:image/svg+xml")) {
 					img.remove();
 					continue;
 				}
 
-				// --- 🔥 彻底去水印逻辑 ---
-				// 第一步：截断问号后面的所有参数（彻底干掉 ?source=...）
-				let hdSrc = rawSrc.split("?")[0];
-				// 第二步：正则匹配并粉碎所有尺寸后缀，还原为原始扩展名
-				hdSrc = hdSrc.replace(
-					/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi,
-					"$1",
-				);
-
+				// 终极无水印还原：截断所有参数
+				let hdSrc = rawSrc
+					.split("?")[0]
+					.replace(/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi, "$1");
 				const imageId = hdSrc.split("/").pop() || hdSrc;
 
 				if (processedImages.has(imageId)) {
-					// 如果重复，重指向已有的本地文件索引
-					const existingIdx =
-						Array.from(processedImages).indexOf(imageId);
 					const ext = hdSrc.split(".").pop() || "jpg";
 					img.setAttribute(
 						"src",
-						`zhihu_${answerId}_${existingIdx}.${ext}`,
+						`zhihu_${answerId}_${Array.from(processedImages).indexOf(imageId)}.${ext}`,
 					);
 					continue;
 				}
@@ -131,19 +154,16 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					const ext = hdSrc.split(".").pop() || "jpg";
 					const imgName = `zhihu_${answerId}_${imageIndex}.${ext}`;
 					const imgPath = `${assetFolder}/${imgName}`;
-
-					if (!(await vault.adapter.exists(imgPath))) {
+					if (!(await vault.adapter.exists(imgPath)))
 						await vault.createBinary(imgPath, imgRes.arrayBuffer);
-					}
 					img.setAttribute("src", imgName);
 					processedImages.add(imageId);
 					imageIndex++;
 				} catch (e) {
-					console.error("高清下载失败:", hdSrc);
+					console.error("图片下载失败", hdSrc);
 				}
 			}
 
-			// 5. 转换 Markdown 并清理
 			const turndownService = new TurndownService({
 				headingStyle: "atx",
 				bulletListMarker: "-",
@@ -160,7 +180,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			);
 			const markdownBody = turndownService.turndown(doc.body.innerHTML);
 
-			// --- 6. 找回所有细节元数据 ---
+			// 找回所有元数据：标题、URL、作者、点赞、评论、日期
 			const fileContent = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
@@ -168,18 +188,15 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				`作者: ${data.author.name}`,
 				`点赞数: ${data.voteup_count}`,
 				`评论数: ${data.comment_count}`,
-				`感谢数: ${data.thanks_count}`,
 				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
 				`最后更新: ${new Date(data.updated_time * 1000).toISOString().split("T")[0]}`,
 				`导入日期: ${new Date().toISOString().split("T")[0]}`,
 				`---`,
-				`# ${apiTitle}`,
-				``,
-				`${markdownBody}`,
+				`# ${apiTitle}\n\n${markdownBody}`,
 			].join("\n");
 
 			const safeFileName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
-			const filePath = `${baseFolder}/${safeFileName}.md`;
+			const filePath = `${this.settings.downloadFolder}/${safeFileName}.md`;
 
 			const existingFile = vault.getAbstractFileByPath(filePath);
 			if (existingFile instanceof TFile) {
@@ -187,11 +204,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			} else {
 				await vault.create(filePath, fileContent);
 			}
-
-			new Notice(`✅ 细节已全部找回！共处理 ${imageIndex} 张图`);
 		} catch (error) {
-			console.error(error);
-			new Notice("❌ 抓取失败");
+			console.error("抓取失败", cleanUrl);
 		}
 	}
 
@@ -205,31 +219,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-}
 
-// Modal 和 SettingTab 保持不变
-class ImportModal extends Modal {
-	url: string = "";
-	onSubmit: (url: string) => void;
-	constructor(app: App, onSubmit: (url: string) => void) {
-		super(app);
-		this.onSubmit = onSubmit;
-	}
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.createEl("h2", { text: "导入高清知乎" });
-		new Setting(contentEl)
-			.setName("链接")
-			.addText((text) => text.onChange((v) => (this.url = v)));
-		new Setting(contentEl).addButton((b) =>
-			b
-				.setButtonText("导入")
-				.setCta()
-				.onClick(() => {
-					this.close();
-					this.onSubmit(this.url);
-				}),
-		);
+	showImportModal() {
+		const modal = new ImportModal(this.app, async (url) => {
+			if (url) await this.fetchZhihuAnswer(url);
+		});
+		modal.open();
 	}
 }
 
@@ -248,12 +243,46 @@ class ZhihuSettingTab extends PluginSettingTab {
 				await this.plugin.saveSettings();
 			}),
 		);
+		new Setting(containerEl)
+			.setName("我的 ID (People ID)")
+			.setDesc("主页 URL 中 people/ 后面那一串")
+			.addText((t) =>
+				t.setValue(this.plugin.settings.zhihuId).onChange(async (v) => {
+					this.plugin.settings.zhihuId = v;
+					await this.plugin.saveSettings();
+				}),
+			);
 		new Setting(containerEl).setName("保存文件夹").addText((t) =>
 			t
 				.setValue(this.plugin.settings.downloadFolder)
 				.onChange(async (v) => {
 					this.plugin.settings.downloadFolder = v;
 					await this.plugin.saveSettings();
+				}),
+		);
+	}
+}
+
+class ImportModal extends Modal {
+	url: string = "";
+	onSubmit: (url: string) => void;
+	constructor(app: App, onSubmit: (url: string) => void) {
+		super(app);
+		this.onSubmit = onSubmit;
+	}
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h2", { text: "导入单个回答" });
+		new Setting(contentEl)
+			.setName("链接")
+			.addText((text) => text.onChange((v) => (this.url = v)));
+		new Setting(contentEl).addButton((b) =>
+			b
+				.setButtonText("开始")
+				.setCta()
+				.onClick(() => {
+					this.close();
+					this.onSubmit(this.url);
 				}),
 		);
 	}
