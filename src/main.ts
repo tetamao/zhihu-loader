@@ -46,44 +46,58 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			return;
 		}
 
-		new Notice("🔍 正在连接知乎，调取你的回答列表...");
+		new Notice("🔍 正在启动全量同步，请保持网络畅通...");
+
+		let offset = 0;
+		let isEnd = false;
+		let totalSuccess = 0;
+
 		try {
-			// 增加 include 参数以确保能拿到话题数据供元数据使用
-			const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=0&limit=20&include=data%5B*%5D.target.question.topics`;
-			const res = await requestUrl({
-				url: url,
-				method: "GET",
-				headers: {
-					Cookie: this.settings.cookie,
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-				},
-			});
+			while (!isEnd) {
+				// 增加 include 参数以确保获取话题数据，增加 limit 和 offset 实现分页
+				const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=${offset}&limit=20&include=data%5B*%5D.target.question.topics`;
 
-			const items = res.json.data;
-			if (!items || items.length === 0) {
-				new Notice("⚠️ 没抓到内容！请检查 ID 或 Cookie 是否失效");
-				return;
-			}
+				const res = await requestUrl({
+					url: url,
+					method: "GET",
+					headers: {
+						Cookie: this.settings.cookie,
+						"User-Agent":
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+					},
+				});
 
-			new Notice(
-				`🚀 发现 ${items.length} 个回答，开始同步至 answers 文件夹...`,
-			);
+				const data = res.json;
+				const items = data.data;
 
-			let successCount = 0;
-			for (const item of items) {
-				const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
-				try {
-					await this.fetchZhihuAnswer(answerUrl);
-					successCount++;
-				} catch (err) {
-					console.error(`同步失败: ${answerUrl}`, err);
+				if (!items || items.length === 0) break;
+
+				new Notice(
+					`逐步抓取中：正在处理第 ${offset + 1} - ${offset + items.length} 条回答...`,
+				);
+
+				for (const item of items) {
+					const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
+					try {
+						await this.fetchZhihuAnswer(answerUrl);
+						totalSuccess++;
+					} catch (err) {
+						console.error(`同步失败: ${answerUrl}`, err);
+					}
 				}
+
+				// 更新分页状态
+				isEnd = data.paging.is_end;
+				offset += 20;
+
+				// 适当延时，防止触发知乎频率限制
+				await new Promise((resolve) => setTimeout(resolve, 1000));
 			}
-			new Notice(`✅ 任务完成！共同步了 ${successCount} 个回答`);
+
+			new Notice(`✅ 全量同步完成！共导入 ${totalSuccess} 个回答`);
 		} catch (e) {
 			console.error(e);
-			new Notice("❌ 同步中断！请检查网络或 Cookie 权限");
+			new Notice("❌ 同步中断！请检查网络或 Cookie");
 		}
 	}
 
@@ -109,8 +123,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			// --- 路径逻辑：固定为 answers 和 attachments ---
 			const baseFolder = this.settings.downloadFolder;
-			const answerFolder = `${baseFolder}/answers`;
-			const assetFolder = `${baseFolder}/attachments`;
+			const answerFolder = `${baseFolder}/answers`; //存放回答
+			const assetFolder = `${baseFolder}/attachments`; //存放图片
 
 			if (!(await vault.adapter.exists(baseFolder)))
 				await vault.createFolder(baseFolder);
