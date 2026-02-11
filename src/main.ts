@@ -46,15 +46,15 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			return;
 		}
 
-		new Notice("🔍 正在启动全量同步，请保持网络畅通...");
+		new Notice("🔍 正在启动增量同步...");
 
 		let offset = 0;
 		let isEnd = false;
 		let totalSuccess = 0;
+		let totalSkipped = 0;
 
 		try {
 			while (!isEnd) {
-				// 增加 include 参数以确保获取话题数据，增加 limit 和 offset 实现分页
 				const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=${offset}&limit=20&include=data%5B*%5D.target.question.topics`;
 
 				const res = await requestUrl({
@@ -72,38 +72,51 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 				if (!items || items.length === 0) break;
 
-				new Notice(
-					`逐步抓取中：正在处理第 ${offset + 1} - ${offset + items.length} 条回答...`,
-				);
-
 				for (const item of items) {
 					const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
 					try {
-						await this.fetchZhihuAnswer(answerUrl);
-						totalSuccess++;
+						// 捕获返回状态
+						const result = await this.fetchZhihuAnswer(answerUrl);
+
+						if (result === "SKIPPED") {
+							totalSkipped++;
+							// 智能熔断：如果当前内容已存在且无更新，则停止向后抓取
+							new Notice(
+								"✨ 检测到本地已有最新内容，同步已自动熔断。",
+							);
+							isEnd = true;
+							break;
+						}
+
+						if (result === "SUCCESS") {
+							totalSuccess++;
+						}
 					} catch (err) {
 						console.error(`同步失败: ${answerUrl}`, err);
 					}
 				}
 
-				// 更新分页状态
+				if (isEnd) break;
+
 				isEnd = data.paging.is_end;
 				offset += 20;
-
-				// 适当延时，防止触发知乎频率限制
 				await new Promise((resolve) => setTimeout(resolve, 1000));
 			}
 
-			new Notice(`✅ 全量同步完成！共导入 ${totalSuccess} 个回答`);
+			new Notice(
+				`✅ 同步结束！新增/更新: ${totalSuccess}，跳过: ${totalSkipped}`,
+			);
 		} catch (e) {
 			console.error(e);
 			new Notice("❌ 同步中断！请检查网络或 Cookie");
 		}
 	}
 
-	async fetchZhihuAnswer(cleanUrl: string) {
+	async fetchZhihuAnswer(
+		cleanUrl: string,
+	): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
 		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
-		if (!answerId) return;
+		if (!answerId) return "FAILED";
 
 		try {
 			const response = await requestUrl({
@@ -121,10 +134,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const apiTitle = data.question.title;
 			const vault = this.app.vault;
 
-			// --- 路径逻辑：固定为 answers 和 attachments ---
+			// --- 路径逻辑 ---
 			const baseFolder = this.settings.downloadFolder;
-			const answerFolder = `${baseFolder}/answers`; //存放回答
-			const assetFolder = `${baseFolder}/attachments`; //存放图片
+			const answerFolder = `${baseFolder}/answers`;
+			const assetFolder = `${baseFolder}/attachments`;
 
 			if (!(await vault.adapter.exists(baseFolder)))
 				await vault.createFolder(baseFolder);
@@ -132,6 +145,20 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				await vault.createFolder(answerFolder);
 			if (!(await vault.adapter.exists(assetFolder)))
 				await vault.createFolder(assetFolder);
+
+			const safeFileName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
+			const filePath = `${answerFolder}/${safeFileName}.md`;
+
+			// --- 核心优化：增量检查 ---
+			const stats = await vault.adapter.stat(filePath);
+			if (stats) {
+				const zhihuUpdateTime = data.updated_time * 1000;
+				// 如果本地修改时间晚于知乎更新时间，说明不需要下载
+				if (stats.mtime >= zhihuUpdateTime) {
+					console.log(`⏩ 跳过: ${apiTitle}`);
+					return "SKIPPED";
+				}
+			}
 
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(data.content, "text/html");
@@ -197,11 +224,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			);
 			const markdownBody = turndownService.turndown(doc.body.innerHTML);
 
-			// 提取话题并处理为带引号的双链格式
 			const topics: string[] =
 				data.question.topics?.map((t: any) => t.name) || [];
-
-			// 关键改动：在 [[ ]] 外面加上单引号 ' '
 			const linkedTopics = topics.map((t) => `'[[${t}]]'`).join(", ");
 
 			const fileContent = [
@@ -209,7 +233,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`作者: ${data.author.name}`,
-				`话题: [${linkedTopics}]`, // 推荐写成数组格式 [ '[[话题1]]', '[[话题2]]' ]
+				`话题: [${linkedTopics}]`,
 				`点赞数: ${data.voteup_count}`,
 				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
 				`导入日期: ${new Date().toISOString().split("T")[0]}`,
@@ -217,20 +241,20 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				`# ${apiTitle}\n\n${markdownBody}`,
 			].join("\n");
 
-			const safeFileName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
-			const filePath = `${answerFolder}/${safeFileName}.md`;
-
 			const existingFile = vault.getAbstractFileByPath(filePath);
 			if (existingFile instanceof TFile) {
 				await vault.modify(existingFile, fileContent);
 			} else {
 				await vault.create(filePath, fileContent);
 			}
+			return "SUCCESS";
 		} catch (error) {
 			console.error("抓取失败", cleanUrl);
+			return "FAILED";
 		}
 	}
 
+	// ... 其余设置界面代码保持不变 ...
 	async loadSettings() {
 		this.settings = Object.assign(
 			{},
@@ -259,14 +283,12 @@ class ZhihuSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-
 		new Setting(containerEl).setName("知乎 Cookie").addTextArea((t) =>
 			t.setValue(this.plugin.settings.cookie).onChange(async (v) => {
 				this.plugin.settings.cookie = v;
 				await this.plugin.saveSettings();
 			}),
 		);
-
 		new Setting(containerEl)
 			.setName("我的 ID (People ID)")
 			.setDesc("主页 URL 中 people/ 后面那一串")
@@ -276,7 +298,6 @@ class ZhihuSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}),
 			);
-
 		new Setting(containerEl).setName("根目录名称").addText((t) =>
 			t
 				.setValue(this.plugin.settings.downloadFolder)
