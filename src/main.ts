@@ -278,7 +278,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			const vault = this.app.vault;
 			const baseFolder = this.settings.downloadFolder;
-			const recommendFolder = `${baseFolder}/recommand`;
+			const recommendFolder = `${baseFolder}/recommend`;
 
 			if (!(await vault.adapter.exists(baseFolder)))
 				await vault.createFolder(baseFolder);
