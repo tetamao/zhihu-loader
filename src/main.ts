@@ -10,16 +10,19 @@ import {
 } from "obsidian";
 import TurndownService from "turndown";
 
+// 1. 定义配置接口，增加开关选项
 interface ZhihuSettings {
 	downloadFolder: string;
 	cookie: string;
 	zhihuId: string;
+	enableRecommendSync: boolean; // 联动开关
 }
 
 const DEFAULT_SETTINGS: ZhihuSettings = {
 	downloadFolder: "Zhihu_Imports",
 	cookie: "",
 	zhihuId: "",
+	enableRecommendSync: false, // 默认关闭联动
 };
 
 export default class ZhihuLoaderPlugin extends Plugin {
@@ -28,21 +31,28 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// 图标 1：全量/增量同步回答
+		// 侧边栏图标 1：全量/增量同步
 		this.addRibbonIcon("refresh-cw", "一键同步我的所有回答", () =>
 			this.syncAllMyAnswers(),
 		);
 
-		// 图标 2：导入单个回答链接
+		// 侧边栏图标 2：导入单个回答
 		this.addRibbonIcon("link", "导入单个回答", () =>
 			this.showImportModal(),
 		);
+
+		// 注册命令面板入口：允许用户不通过同步，手动独立触发推荐抓取
+		this.addCommand({
+			id: "fetch-zhihu-recommendation-only",
+			name: "获取今日创作者中心推荐",
+			callback: () => this.fetchCreatorRecommendQuestions(),
+		});
 
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
 	/**
-	 * 全量同步逻辑：支持分页与智能熔断
+	 * 一键同步：同步回答结束后，检查开关并决定是否抓取推荐
 	 */
 	async syncAllMyAnswers() {
 		const userId = this.settings.zhihuId;
@@ -80,15 +90,11 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
 					try {
 						const result = await this.fetchZhihuAnswer(answerUrl);
-
 						if (result === "SKIPPED") {
-							new Notice(
-								"✨ 检测到本地已有最新内容，同步已自动熔断。",
-							);
-							isEnd = true;
+							new Notice("✨ 检测到本地内容已是最新，同步完成。");
+							isEnd = true; // 触发熔断
 							break;
 						}
-
 						if (result === "SUCCESS") totalSuccess++;
 					} catch (err) {
 						console.error(`同步失败: ${answerUrl}`, err);
@@ -101,7 +107,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				await new Promise((resolve) => setTimeout(resolve, 1000));
 			}
 
-			new Notice(`✅ 同步完成！本次处理: ${totalSuccess} 条`);
+			new Notice(`✅ 回答同步完成！本次新增/更新: ${totalSuccess} 条`);
+
+			// --- 联动逻辑：如果开启了设置中的开关，则自动触发推荐抓取 ---
+			if (this.settings.enableRecommendSync) {
+				await this.fetchCreatorRecommendQuestions();
+			}
 		} catch (e) {
 			console.error(e);
 			new Notice("❌ 同步中断！请检查网络或 Cookie");
@@ -109,7 +120,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	}
 
 	/**
-	 * 核心抓取函数：包含图片本地化和目录创建
+	 * 获取单个回答的核心逻辑（包含图片本地化）
 	 */
 	async fetchZhihuAnswer(
 		cleanUrl: string,
@@ -137,6 +148,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const answerFolder = `${baseFolder}/answers`;
 			const assetFolder = `${baseFolder}/attachments`;
 
+			// 分级创建目录
 			if (!(await vault.adapter.exists(baseFolder)))
 				await vault.createFolder(baseFolder);
 			if (!(await vault.adapter.exists(answerFolder)))
@@ -158,6 +170,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const processedImages = new Set<string>();
 			let imageIndex = 0;
 
+			// 图片本地化处理
 			const imgs = Array.from(doc.querySelectorAll("img"));
 			for (const img of imgs) {
 				let rawSrc =
@@ -168,20 +181,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					img.remove();
 					continue;
 				}
-
 				let hdSrc = rawSrc
 					.split("?")[0]
 					.replace(/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi, "$1");
 				const imageId = hdSrc.split("/").pop() || hdSrc;
 
-				if (processedImages.has(imageId)) {
-					const ext = hdSrc.split(".").pop() || "jpg";
-					img.setAttribute(
-						"src",
-						`zhihu_${answerId}_${Array.from(processedImages).indexOf(imageId)}.${ext}`,
-					);
-					continue;
-				}
+				if (processedImages.has(imageId)) continue;
 
 				try {
 					const imgRes = await requestUrl({
@@ -196,9 +201,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					img.setAttribute("src", imgName);
 					processedImages.add(imageId);
 					imageIndex++;
-				} catch (e) {
-					console.error("图片下载失败", hdSrc);
-				}
+				} catch (e) {}
 			}
 
 			const turndownService = new TurndownService({
@@ -227,9 +230,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				`url: ${cleanUrl}`,
 				`作者: ${data.author.name}`,
 				`话题: [${linkedTopics}]`,
-				`点赞数: ${data.voteup_count}`,
 				`回答日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
-				`导入日期: ${new Date().toISOString().split("T")[0]}`,
 				`---`,
 				`# ${apiTitle}\n\n${markdownBody}`,
 			].join("\n");
@@ -247,15 +248,13 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	}
 
 	/**
-	 * 创作者推荐抓取逻辑
+	 * 抓取推荐列表（支持独立调用或联动调用）
 	 */
 	async fetchCreatorRecommendQuestions() {
 		if (!this.settings.cookie) {
-			new Notice("❌ 无法抓取：请先填写知乎 Cookie");
+			new Notice("⚠️ 联动失败：请先设置知乎 Cookie");
 			return;
 		}
-
-		new Notice("🔍 正在从创作者中心获取推荐...");
 
 		try {
 			const res = await requestUrl({
@@ -269,12 +268,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			});
 
 			const items = res.json.data;
-			if (!items || items.length === 0) {
-				new Notice(
-					"⚠️ 未发现推荐问题，请确认 Cookie 是否包含创作者权限",
-				);
-				return;
-			}
+			if (!items || items.length === 0) return;
 
 			const vault = this.app.vault;
 			const baseFolder = this.settings.downloadFolder;
@@ -303,13 +297,14 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				await vault.create(filePath, tableContent);
 			}
 
-			new Notice(`✅ 推荐获取成功！已保存至 ${filePath}`);
+			new Notice(`✨ 联动同步：推荐列表已更新`);
+
+			// 如果是手动触发的，则自动打开文件
 			const file = vault.getAbstractFileByPath(filePath);
 			if (file instanceof TFile)
 				this.app.workspace.getLeaf().openFile(file);
 		} catch (e) {
-			console.error(e);
-			new Notice("❌ 获取推荐失败，请检查网络");
+			new Notice("❌ 推荐抓取失败");
 		}
 	}
 
@@ -349,15 +344,12 @@ class ZhihuSettingTab extends PluginSettingTab {
 			}),
 		);
 
-		new Setting(containerEl)
-			.setName("我的 ID (People ID)")
-			.setDesc("主页 URL 中 people/ 后面那一串")
-			.addText((t) =>
-				t.setValue(this.plugin.settings.zhihuId).onChange(async (v) => {
-					this.plugin.settings.zhihuId = v;
-					await this.plugin.saveSettings();
-				}),
-			);
+		new Setting(containerEl).setName("我的 ID (People ID)").addText((t) =>
+			t.setValue(this.plugin.settings.zhihuId).onChange(async (v) => {
+				this.plugin.settings.zhihuId = v;
+				await this.plugin.saveSettings();
+			}),
+		);
 
 		new Setting(containerEl).setName("根目录名称").addText((t) =>
 			t
@@ -368,16 +360,18 @@ class ZhihuSettingTab extends PluginSettingTab {
 				}),
 		);
 
-		// --- 交互优化：将抓取按钮放在设置页 ---
+		// 联动同步开关
 		new Setting(containerEl)
-			.setName("立即抓取推荐问题")
-			.setDesc("从知乎创作者中心抓取最新的推荐问题并生成表格。")
-			.addButton((btn) =>
-				btn
-					.setButtonText("开始抓取")
-					.setCta()
-					.onClick(async () => {
-						await this.plugin.fetchCreatorRecommendQuestions();
+			.setName("同步时自动抓取推荐")
+			.setDesc(
+				"开启后，每次点击侧边栏同步回答时，会自动更新今日创作者推荐列表。",
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.enableRecommendSync)
+					.onChange(async (value) => {
+						this.plugin.settings.enableRecommendSync = value;
+						await this.plugin.saveSettings();
 					}),
 			);
 	}
