@@ -32,7 +32,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 
-		// 侧边栏图标
 		this.addRibbonIcon("refresh-cw", "一键同步我的所有回答", () =>
 			this.syncAllMyAnswers(),
 		);
@@ -41,7 +40,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			this.showImportModal(),
 		);
 
-		// 命令面板独立触发
 		this.addCommand({
 			id: "fetch-zhihu-recommendation-only",
 			name: "获取今日创作者中心推荐",
@@ -57,13 +55,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
-	/**
-	 * 同步主入口
-	 */
 	async syncAllMyAnswers() {
 		const userId = this.settings.zhihuId;
 		if (!userId) {
-			new Notice("❌ 报错：请先在设置中填写你的用户 ID");
+			new Notice("❌ 报错：请先设置用户 ID");
 			return;
 		}
 
@@ -74,7 +69,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		let totalSuccess = 0;
 
 		try {
-			// 1. 同步回答
 			while (!isEnd) {
 				const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=${offset}&limit=20&include=data%5B*%5D.target.question.topics`;
 				const res = await requestUrl({
@@ -96,7 +90,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					try {
 						const result = await this.fetchZhihuAnswer(answerUrl);
 						if (result === "SKIPPED") {
-							new Notice("✨ 检测到本地内容已是最新。");
+							new Notice("✨ 内容已是最新。");
 							isEnd = true;
 							break;
 						}
@@ -113,22 +107,17 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			new Notice(`✅ 回答同步完成！新增: ${totalSuccess} 条`);
 
-			// 2. 联动：创作者推荐
-			if (this.settings.enableRecommendSync) {
+			if (this.settings.enableRecommendSync)
 				await this.fetchCreatorRecommendQuestions();
-			}
-
-			// 3. 联动：好物推荐 (2.0 核心)
-			if (this.settings.enableGoodsSync) {
+			if (this.settings.enableGoodsSync)
 				await this.fetchGoodsRecommendQuestions();
-			}
 		} catch (e) {
-			new Notice("❌ 同步中断！请检查网络或 Cookie");
+			new Notice("❌ 同步中断！请检查 Cookie");
 		}
 	}
 
 	/**
-	 * 【2.0 修复】好物推荐抓取 - 基于截图 API 修改
+	 * 【2.0.2 修复】好物推荐抓取 - 修正 Token 映射链接逻辑
 	 */
 	async fetchGoodsRecommendQuestions() {
 		if (!this.settings.cookie) {
@@ -137,7 +126,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		}
 
 		try {
-			// 使用截图中的 API 路径
 			const url =
 				"https://www.zhihu.com/api/v4/mcn/recommend/question?tab_id=0&offset=0&limit=20";
 
@@ -155,7 +143,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			const items = res.json.data;
 			if (!items || items.length === 0) {
-				new Notice("⚠️ 好物 API 未返回有效数据，请检查 Cookie 权限");
+				new Notice("⚠️ 好物列表为空");
 				return;
 			}
 
@@ -163,7 +151,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const base = this.settings.downloadFolder;
 			const goodsPath = `${base}/Goods`;
 
-			// 严谨的文件夹分级创建
 			if (!(await vault.adapter.exists(base)))
 				await vault.createFolder(base);
 			if (!(await vault.adapter.exists(goodsPath)))
@@ -174,32 +161,34 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				"| 问题标题 | 回答数 | 浏览量 | 链接 |\n| :--- | :--- | :--- | :--- |\n";
 
 			items.forEach((item: any) => {
-				const q = item.question || item; // 适配不同 API 返回层级
-				if (!q.title) return;
-				const title = q.title.replace(/\|/g, "\\|");
-				const link = `https://www.zhihu.com/question/${q.id}`;
-				const answers = q.answer_count || 0;
-				const views = q.visit_count || "N/A";
-				md += `| ${title} | ${answers} | ${views} | [查看详情](${link}) |\n`;
+				// 关键修复：使用 token 作为问题 ID 构造链接
+				const questionId =
+					item.token || (item.question && item.question.id);
+				if (!questionId || !item.title) return;
+
+				const title = item.title.replace(/\|/g, "\\|");
+				const link = `https://www.zhihu.com/question/${questionId}`;
+				const answers = item.answer_count || 0;
+				const views = item.visit_count || "N/A";
+
+				md += `| ${title} | ${answers} | ${views} | [直达问题](${link}) |\n`;
 			});
 
 			const fileName = `${goodsPath}/好物推荐_${new Date().toISOString().split("T")[0]}.md`;
 			const file = vault.getAbstractFileByPath(fileName);
 
-			if (file instanceof TFile) {
-				await vault.modify(file, md);
-			} else {
-				await vault.create(fileName, md);
-			}
-			new Notice("✅ 好物清单同步成功 (Goods 文件夹)");
+			if (file instanceof TFile) await vault.modify(file, md);
+			else await vault.create(fileName, md);
+
+			new Notice("✅ 好物清单链接已修正，同步成功");
 		} catch (e) {
 			console.error("Goods Sync Error:", e);
-			new Notice("❌ 好物推荐抓取失败，请在控制台查看详情");
+			new Notice("❌ 好物推荐抓取失败");
 		}
 	}
 
 	/**
-	 * 创作者推荐 (V1.1 逻辑)
+	 * 创作者推荐抓取
 	 */
 	async fetchCreatorRecommendQuestions() {
 		if (!this.settings.cookie) return;
@@ -230,12 +219,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const file = vault.getAbstractFileByPath(fileName);
 			if (file instanceof TFile) await vault.modify(file, md);
 			else await vault.create(fileName, md);
-			new Notice("✅ 创作者推荐同步成功");
+			new Notice("✅ 创作者推荐已同步");
 		} catch (e) {}
 	}
 
 	/**
-	 * 单个回答抓取 (V1 核心 - 包含图片下载)
+	 * 回答抓取核心逻辑 (带图片本地化)
 	 */
 	async fetchZhihuAnswer(
 		cleanUrl: string,
