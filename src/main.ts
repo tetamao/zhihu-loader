@@ -161,7 +161,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				"| 问题标题 | 回答数 | 浏览量 | 链接 |\n| :--- | :--- | :--- | :--- |\n";
 
 			items.forEach((item: any) => {
-				// 关键修复：使用 token 作为问题 ID 构造链接
 				const questionId =
 					item.token || (item.question && item.question.id);
 				if (!questionId || !item.title) return;
@@ -188,39 +187,78 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	}
 
 	/**
-	 * 创作者推荐抓取
+	 * 创作者推荐抓取 - 2026/4/2 更新补全推荐理由与提问者
 	 */
 	async fetchCreatorRecommendQuestions() {
-		if (!this.settings.cookie) return;
+		if (!this.settings.cookie) {
+			new Notice("⚠️ 请先设置知乎 Cookie");
+			return;
+		}
 		try {
 			const res = await requestUrl({
 				url: "https://www.zhihu.com/api/v4/creators/question_route/author_related/recommend?limit=20&offset=0&page_source=web_author_recommend",
 				method: "GET",
-				headers: { Cookie: this.settings.cookie },
+				headers: {
+					Cookie: this.settings.cookie,
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+				},
 			});
 			const items = res.json.data;
-			if (!items || items.length === 0) return;
+			if (!items || items.length === 0) {
+				new Notice("⚠️ 创作者推荐列表为空");
+				return;
+			}
 
 			const vault = this.app.vault;
-			const folder = `${this.settings.downloadFolder}/recommend`;
-			if (!(await vault.adapter.exists(this.settings.downloadFolder)))
-				await vault.createFolder(this.settings.downloadFolder);
-			if (!(await vault.adapter.exists(folder)))
-				await vault.createFolder(folder);
+			const baseFolder = this.settings.downloadFolder;
+			const recommendFolder = `${baseFolder}/recommend`;
 
-			let md = `## 创作者推荐 (${new Date().toLocaleDateString()})\n\n| 标题 | 回答数 | 链接 |\n| :--- | :--- | :--- |\n`;
-			items.forEach((item: any) => {
+			// 确保文件夹存在
+			if (!(await vault.adapter.exists(baseFolder)))
+				await vault.createFolder(baseFolder);
+			if (!(await vault.adapter.exists(recommendFolder)))
+				await vault.createFolder(recommendFolder);
+
+			let tableContent = `## 创作者中心推荐列表\n生成时间: ${new Date().toLocaleString()}\n\n`;
+			tableContent +=
+				"| 问题标题 | 推荐理由 | 提问者 | 回答数 | 链接 |\n| :--- | :--- | :--- | :--- | :--- |\n";
+
+			for (const item of items) {
 				const q = item.question;
-				if (q)
-					md += `| ${q.title.replace(/\|/g, "\\|")} | ${q.answer_count} | [详情](https://www.zhihu.com/question/${q.id}) |\n`;
-			});
+				if (!q) continue;
 
-			const fileName = `${folder}/创作者推荐_${new Date().toISOString().split("T")[0]}.md`;
-			const file = vault.getAbstractFileByPath(fileName);
-			if (file instanceof TFile) await vault.modify(file, md);
-			else await vault.create(fileName, md);
-			new Notice("✅ 创作者推荐已同步");
-		} catch (e) {}
+				// 1. 获取动态推荐理由 (item.reason 是知乎 API 返回的个性化理由)
+				const reason = item.reason || "系统推荐";
+
+				// 2. 获取提问者名称 (q.author 可能存在于嵌套对象中)
+				const authorName = q.author?.name || "匿名用户";
+
+				const safeTitle = q.title.replace(/\|/g, "\\|");
+				const answerCount = q.answer_count || 0;
+				const link = `https://www.zhihu.com/question/${q.id}`;
+
+				tableContent += `| ${safeTitle} | ${reason} | ${authorName} | ${answerCount} | [查看问题](${link}) |\n`;
+			}
+
+			const filePath = `${recommendFolder}/创作者推荐_${new Date().toISOString().split("T")[0]}.md`;
+			const existingFile = vault.getAbstractFileByPath(filePath);
+
+			if (existingFile instanceof TFile) {
+				await vault.modify(existingFile, tableContent);
+			} else {
+				await vault.create(filePath, tableContent);
+			}
+
+			new Notice(`✅ 推荐获取成功！已保存至 ${filePath}`);
+
+			const finalFile = vault.getAbstractFileByPath(filePath);
+			if (finalFile instanceof TFile)
+				this.app.workspace.getLeaf().openFile(finalFile);
+		} catch (e) {
+			console.error(e);
+			new Notice("❌ 获取推荐失败，请检查网络或 Cookie");
+		}
 	}
 
 	/**
@@ -320,6 +358,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`话题: [${topics}]`,
+				`点赞数: ${data.voteup_count}`,
 				`日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
 				`---`,
 				`# ${apiTitle}\n\n${body}`,
