@@ -240,7 +240,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			let md = `## 知乎好物推荐列表 (${new Date().toLocaleDateString()})\n`;
 			md += `生成时间: ${new Date().toLocaleString()}\n\n`;
-			md += "| 问题标题 | 回答数 | 浏览量 | 关注数 | 问题创建时间 | 链接 |\n";
+			md +=
+				"| 问题标题 | 回答数 | 浏览量 | 关注数 | 问题创建时间 | 链接 |\n";
 			md += "| :--- | :---: | :---: | :---: | :---: | :--- |\n";
 
 			items.forEach((item: any) => {
@@ -259,10 +260,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				// 将 Unix 时间戳（秒）解析为可读日期
 				const createdDate = q.created
 					? new Date(q.created * 1000).toLocaleDateString("zh-CN", {
-						year: "numeric",
-						month: "2-digit",
-						day: "2-digit",
-					  })
+							year: "numeric",
+							month: "2-digit",
+							day: "2-digit",
+						})
 					: "未知";
 
 				md += `| ${title} | ${answers} | ${views} | ${followers} | ${createdDate} | [直达问题](${link}) |\n`;
@@ -358,6 +359,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 	/**
 	 * 回答抓取核心逻辑 (带图片本地化)
+	 * v2.0.4: 修复统计数据 undefined 问题，增强健壮性
 	 */
 	async fetchZhihuAnswer(
 		cleanUrl: string,
@@ -365,8 +367,13 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
 		if (!answerId) return "FAILED";
 
+		let voteupCount = 0,
+			commentCount = 0,
+			collectCount = 0,
+			readCount = 0;
+
 		try {
-			// 第一步：轻量请求获取基本信息（content 等在第二步单独取）
+			// ========== 第一阶段：获取基本信息（不包含 voteup_count 等统计字段） ==========
 			const infoRes = await requestUrl({
 				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=question,author,created_time,updated_time,question.topics`,
 				method: "GET",
@@ -378,30 +385,96 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			});
 			const info = infoRes.json;
 
-			// 第二步：从问题回答列表获取点赞/评论/感谢数（直接 answer API 不稳定）
-			let voteupCount = 0, commentCount = 0, thanksCount = 0;
-			const questionId = info.question?.id;
-			if (questionId) {
-				for (let offset = 0; offset < 200; offset += 20) {
-					const listRes = await requestUrl({
-						url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${offset}&sort_by=created_time`,
+			// ========== 第二阶段：获取统计数据 ==========
+			// 策略：优先使用 creations/v2/all（返回结构化字段），失败则降级到 link_card_infos（从 desc 解析）
+			let statsFromCreations = false;
+			
+			// 方案A：尝试 creations/v2/all API（需要正确设置时间范围）
+			try {
+				const authorId = info.author?.id || info.author?.url_token;
+				
+				if (authorId) {
+					// 估算回答的创建时间范围：往前推5年，足够覆盖绝大多数回答
+					const now = Math.floor(Date.now() / 1000);
+					const fiveYearsAgo = now - 5 * 365 * 24 * 60 * 60;
+					
+					// 使用更大的 limit，并尝试不同的 offset
+					for (let attempt = 0; attempt < 3; attempt++) {
+						const offset = attempt * 500;
+						const creationsRes = await requestUrl({
+							url: `https://www.zhihu.com/api/v4/creators/creations/v2/all?start=${now}&end=${fiveYearsAgo}&limit=500&offset=${offset}&need_co_creation=1&sort_type=created`,
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+								Cookie: this.settings.cookie,
+							},
+						});
+						const creationsData = creationsRes.json;
+						const dataList = creationsData.data || [];
+						
+						console.log(`[zhihu-loader] creations/v2/all: 获取到 ${dataList.length} 条数据`);
+						
+						// 正确的数据结构：统计字段在 reaction 对象里
+						// { type: "answer", data: { id: "xxx" }, reaction: { vote_up_count, comment_count, ... } }
+						if (dataList.length > 0) {
+							// 检查是否是正确的数据结构（有 reaction 字段）
+							const hasReaction = dataList.some((item: any) => item.reaction?.vote_up_count !== undefined);
+							if (hasReaction) {
+								const answerData = dataList.find(
+									(item: any) => item.type === "answer" && String(item.data?.id) === String(answerId)
+								);
+								if (answerData) {
+									voteupCount = answerData.reaction?.vote_up_count || 0;
+									commentCount = answerData.reaction?.comment_count || 0;
+									collectCount = answerData.reaction?.collect_count || 0;
+									readCount = answerData.reaction?.read_count || 0;
+									statsFromCreations = true;
+									console.log(`[zhihu-loader] ✓ 从creations获取: voteup=${voteupCount}, comment=${commentCount}, collect=${collectCount}, read=${readCount}`);
+									break;
+								}
+							} else {
+								// creations/v2/all 没有统计字段，说明API结构变了
+								console.log(`[zhihu-loader] creations/v2/all 无reaction字段，跳过`);
+								break;
+							}
+						}
+					}
+				}
+			} catch (e) {
+				console.warn(`[zhihu-loader] creations/v2/all 请求失败:`, e);
+			}
+
+			// 方案B：降级到 link_card_infos API（从 extra_info.desc 解析）
+			if (!statsFromCreations) {
+				try {
+					const answerUrl = encodeURIComponent(`https://www.zhihu.com/question/${info.question?.id}/answer/${answerId}`);
+					const cardRes = await requestUrl({
+						url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${answerUrl}`,
 						method: "GET",
 						headers: {
-							"User-Agent": "Mozilla/5.0",
+							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 							Cookie: this.settings.cookie,
 						},
 					});
-					const listData = listRes.json;
-					const match = listData.data?.find(
-						(a: any) => a.id === answerId,
-					);
-					if (match) {
-						voteupCount = match.voteup_count ?? 0;
-						commentCount = match.comment_count ?? 0;
-						thanksCount = match.thanks_count ?? 0;
-						break;
-					}
-					if (!listData.data || listData.data.length < 20) break;
+					const cardData = cardRes.json;
+					
+				// 获取第一个 URL 的 extra_info（cardData 是对象，键是 URL）
+				const firstUrl = Object.keys(cardData)[0];
+				const cardInfo = firstUrl ? cardData[firstUrl] : null;
+				
+				if (cardInfo?.extra_info) {
+					const extraInfo = JSON.parse(cardInfo.extra_info);
+					const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
+					console.log(`[zhihu-loader] link_card_infos: ${desc}`);
+					
+					// 解析格式："222 赞同 · 81 评论"
+					const voteupMatch = desc.match(/(\d+)\s*赞同/);
+					const commentMatch = desc.match(/(\d+)\s*评论/);
+					if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
+					if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
+				}
+				} catch (e) {
+					console.warn(`[zhihu-loader] link_card_infos 请求失败:`, e);
 				}
 			}
 
@@ -437,7 +510,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				return "SKIPPED";
 
 			const parser = new DOMParser();
-			const doc = parser.parseFromString(contentData.content, "text/html");
+			const doc = parser.parseFromString(
+				contentData.content,
+				"text/html",
+			);
 			const imgs = Array.from(doc.querySelectorAll("img"));
 			const processed = new Set<string>();
 			let idx = 0;
@@ -482,24 +558,26 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				replacement: (content, node: any) => {
 					const s = node.getAttribute("src");
 					// 只处理本地化后的文件名（不含协议头），跳过 data URI 和 http 链接
-					if (!s || s.startsWith("http") || s.startsWith("data:")) return "";
+					if (!s || s.startsWith("http") || s.startsWith("data:"))
+						return "";
 					return `![[${s}]]`;
 				},
 			});
 			const body = turndown.turndown(doc.body.innerHTML);
-		const topics =
-			info.question.topics
-				?.map((t: any) => `'[[${t.name}]]'`)
-				.join(", ") || "";
+			const topics =
+				info.question.topics
+					?.map((t: any) => `'[[${t.name}]]'`)
+					.join(", ") || "";
 
-		const content = [
+			const content = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`话题: [${topics}]`,
 				`点赞数: ${voteupCount}`,
 				`评论数: ${commentCount}`,
-				`感谢数: ${thanksCount}`,
+				`收藏数: ${collectCount}`,
+				`阅读数: ${readCount}`,
 				`作者: ${info.author?.name ?? ""}`,
 				`日期: ${new Date(info.created_time * 1000).toISOString().split("T")[0]}`,
 				`更新: ${new Date(info.updated_time * 1000).toISOString().split("T")[0]}`,

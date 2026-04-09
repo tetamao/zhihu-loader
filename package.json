@@ -1,6 +1,6 @@
 {
 	"name": "zhihu-loader",
-	"version": "2.0.3",
+	"version": "2.0.7",
 	"description": "Zhihu content sync plugin for Obsidian.",
 	"main": "main.js",
 	"type": "module",
