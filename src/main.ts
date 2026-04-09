@@ -366,8 +366,9 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		if (!answerId) return "FAILED";
 
 		try {
-			const response = await requestUrl({
-				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content,author,question,updated_time,created_time,question.topics`,
+			// 第一步：轻量请求获取基本信息（content 等在第二步单独取）
+			const infoRes = await requestUrl({
+				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=question,author,created_time,updated_time,question.topics`,
 				method: "GET",
 				headers: {
 					"User-Agent":
@@ -375,9 +376,48 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					Cookie: this.settings.cookie,
 				},
 			});
+			const info = infoRes.json;
 
-			const data = response.json;
-			const apiTitle = data.question.title;
+			// 第二步：从问题回答列表获取点赞/评论/感谢数（直接 answer API 不稳定）
+			let voteupCount = 0, commentCount = 0, thanksCount = 0;
+			const questionId = info.question?.id;
+			if (questionId) {
+				for (let offset = 0; offset < 200; offset += 20) {
+					const listRes = await requestUrl({
+						url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${offset}&sort_by=created_time`,
+						method: "GET",
+						headers: {
+							"User-Agent": "Mozilla/5.0",
+							Cookie: this.settings.cookie,
+						},
+					});
+					const listData = listRes.json;
+					const match = listData.data?.find(
+						(a: any) => a.id === answerId,
+					);
+					if (match) {
+						voteupCount = match.voteup_count ?? 0;
+						commentCount = match.comment_count ?? 0;
+						thanksCount = match.thanks_count ?? 0;
+						break;
+					}
+					if (!listData.data || listData.data.length < 20) break;
+				}
+			}
+
+			// 第三步：获取回答正文内容
+			const contentRes = await requestUrl({
+				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content`,
+				method: "GET",
+				headers: {
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+					Cookie: this.settings.cookie,
+				},
+			});
+			const contentData = contentRes.json;
+
+			const apiTitle = info.question.title;
 			const vault = this.app.vault;
 			const base = this.settings.downloadFolder;
 			const answerDir = `${base}/answers`;
@@ -393,11 +433,11 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const safeName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
 			const path = `${answerDir}/${safeName}.md`;
 			const stats = await vault.adapter.stat(path);
-			if (stats && stats.mtime >= data.updated_time * 1000)
+			if (stats && stats.mtime >= info.updated_time * 1000)
 				return "SKIPPED";
 
 			const parser = new DOMParser();
-			const doc = parser.parseFromString(data.content, "text/html");
+			const doc = parser.parseFromString(contentData.content, "text/html");
 			const imgs = Array.from(doc.querySelectorAll("img"));
 			const processed = new Set<string>();
 			let idx = 0;
@@ -439,22 +479,28 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				filter: "img",
 				replacement: (content, node: any) => {
 					const s = node.getAttribute("src");
-					return s && !s.startsWith("http") ? `![[${s}]]` : "";
+					// 只处理本地化后的文件名（不含协议头），跳过 data URI 和 http 链接
+					if (!s || s.startsWith("http") || s.startsWith("data:")) return "";
+					return `![[${s}]]`;
 				},
 			});
 			const body = turndown.turndown(doc.body.innerHTML);
-			const topics =
-				data.question.topics
-					?.map((t: any) => `'[[${t.name}]]'`)
-					.join(", ") || "";
+		const topics =
+			info.question.topics
+				?.map((t: any) => `'[[${t.name}]]'`)
+				.join(", ") || "";
 
-			const content = [
+		const content = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
 				`url: ${cleanUrl}`,
 				`话题: [${topics}]`,
-				`点赞数: ${data.voteup_count}`,
-				`日期: ${new Date(data.created_time * 1000).toISOString().split("T")[0]}`,
+				`点赞数: ${voteupCount}`,
+				`评论数: ${commentCount}`,
+				`感谢数: ${thanksCount}`,
+				`作者: ${info.author?.name ?? ""}`,
+				`日期: ${new Date(info.created_time * 1000).toISOString().split("T")[0]}`,
+				`更新: ${new Date(info.updated_time * 1000).toISOString().split("T")[0]}`,
 				`---`,
 				`# ${apiTitle}\n\n${body}`,
 			].join("\n");
