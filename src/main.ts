@@ -52,6 +52,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			callback: () => this.fetchGoodsRecommendQuestions(),
 		});
 
+		this.addCommand({
+			id: "fetch-zhihu-goods-recommendation-v2",
+			name: "获取今日好物推荐问题（新版含详细信息）",
+			callback: () => this.fetchGoodsRecommendQuestionsV2(),
+		});
+
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
@@ -110,7 +116,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			if (this.settings.enableRecommendSync)
 				await this.fetchCreatorRecommendQuestions();
 			if (this.settings.enableGoodsSync)
-				await this.fetchGoodsRecommendQuestions();
+				await this.fetchGoodsRecommendQuestionsV2();
 		} catch (e) {
 			new Notice("❌ 同步中断！请检查 Cookie");
 		}
@@ -182,6 +188,95 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			new Notice("✅ 好物清单链接已修正，同步成功");
 		} catch (e) {
 			console.error("Goods Sync Error:", e);
+			new Notice("❌ 好物推荐抓取失败");
+		}
+	}
+
+	/**
+	 * 【2.1.0 新增】好物推荐抓取 v2 - 使用新 API 端点，获取完整问题信息
+	 * 新端点: /api/v4/creators/question_route/author_related/goods
+	 * 新增字段: answer_count, visit_count, follower_count, created(问题创建时间)
+	 * 链接直接使用 API 返回的 question.url
+	 */
+	async fetchGoodsRecommendQuestionsV2() {
+		if (!this.settings.cookie) {
+			new Notice("⚠️ 请先设置知乎 Cookie");
+			return;
+		}
+
+		try {
+			const url =
+				"https://www.zhihu.com/api/v4/creators/question_route/author_related/goods" +
+				"?mcn=goods" +
+				"&include=data%5B*%5D.label%2Creason_info%2Cquestion.answer_count%2Cfollower_count%2Cdetail%2Cauthor%2Ccreated" +
+				"&limit=20&offset=0&page_source=web_author_recommend";
+
+			const res = await requestUrl({
+				url: url,
+				method: "GET",
+				headers: {
+					Cookie: this.settings.cookie,
+					"User-Agent":
+						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+					Referer:
+						"https://www.zhihu.com/creator/content-growth/mcn-question",
+				},
+			});
+
+			const items = res.json.data;
+			if (!items || items.length === 0) {
+				new Notice("⚠️ 好物列表为空");
+				return;
+			}
+
+			const vault = this.app.vault;
+			const base = this.settings.downloadFolder;
+			const goodsPath = `${base}/Goods`;
+
+			if (!(await vault.adapter.exists(base)))
+				await vault.createFolder(base);
+			if (!(await vault.adapter.exists(goodsPath)))
+				await vault.createFolder(goodsPath);
+
+			let md = `## 知乎好物推荐列表 (${new Date().toLocaleDateString()})\n`;
+			md += `生成时间: ${new Date().toLocaleString()}\n\n`;
+			md += "| 问题标题 | 回答数 | 浏览量 | 关注数 | 问题创建时间 | 链接 |\n";
+			md += "| :--- | :---: | :---: | :---: | :---: | :--- |\n";
+
+			items.forEach((item: any) => {
+				const q = item.question;
+				if (!q || !q.title) return;
+
+				const title = q.title.replace(/\|/g, "\\|");
+
+				// 直接使用 API 返回的完整 URL，无需手动拼接
+				const link = q.url || `https://www.zhihu.com/question/${q.id}`;
+
+				const answers = q.answer_count ?? 0;
+				const views = q.visit_count ?? "N/A";
+				const followers = q.follower_count ?? 0;
+
+				// 将 Unix 时间戳（秒）解析为可读日期
+				const createdDate = q.created
+					? new Date(q.created * 1000).toLocaleDateString("zh-CN", {
+						year: "numeric",
+						month: "2-digit",
+						day: "2-digit",
+					  })
+					: "未知";
+
+				md += `| ${title} | ${answers} | ${views} | ${followers} | ${createdDate} | [直达问题](${link}) |\n`;
+			});
+
+			const fileName = `${goodsPath}/好物推荐_${new Date().toISOString().split("T")[0]}.md`;
+			const file = vault.getAbstractFileByPath(fileName);
+
+			if (file instanceof TFile) await vault.modify(file, md);
+			else await vault.create(fileName, md);
+
+			new Notice("✅ 好物推荐（新版）同步成功");
+		} catch (e) {
+			console.error("Goods Sync V2 Error:", e);
 			new Notice("❌ 好物推荐抓取失败");
 		}
 	}
