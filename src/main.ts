@@ -193,7 +193,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	}
 
 	/**
-	 * 【2.1.0 新增】好物推荐抓取 v2 - 使用新 API 端点，获取完整问题信息
+	 * 【2.0.3 新增】好物推荐抓取 v2 - 使用新 API 端点，获取完整问题信息
 	 * 新端点: /api/v4/creators/question_route/author_related/goods
 	 * 新增字段: answer_count, visit_count, follower_count, created(问题创建时间)
 	 * 链接直接使用 API 返回的 question.url
@@ -468,7 +468,9 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					img.setAttribute("src", name);
 					processed.add(id);
 					idx++;
-				} catch (e) {}
+				} catch (e) {
+					console.warn(`⚠️ 图片下载失败: ${hd}`, e);
+				}
 			}
 
 			const turndown = new TurndownService({
@@ -541,12 +543,18 @@ class ZhihuSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		new Setting(containerEl).setName("知乎 Cookie").addTextArea((t) =>
-			t.setValue(this.plugin.settings.cookie).onChange(async (v) => {
-				this.plugin.settings.cookie = v;
-				await this.plugin.saveSettings();
-			}),
-		);
+		new Setting(containerEl)
+			.setName("知乎 Cookie")
+			.setDesc("用于获取推荐内容，Cookie 信息将隐藏显示")
+			.addText((t) =>
+				t
+					.setPlaceholder("输入你的知乎 Cookie")
+					.setValue(this.plugin.settings.cookie)
+					.onChange(async (v) => {
+						this.plugin.settings.cookie = v;
+						await this.plugin.saveSettings();
+					}),
+			);
 		new Setting(containerEl).setName("我的 ID (People ID)").addText((t) =>
 			t.setValue(this.plugin.settings.zhihuId).onChange(async (v) => {
 				this.plugin.settings.zhihuId = v;
