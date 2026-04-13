@@ -28,6 +28,188 @@ const DEFAULT_SETTINGS: ZhihuSettings = {
 
 export default class ZhihuLoaderPlugin extends Plugin {
 	settings: ZhihuSettings;
+	// creations 缓存：key=answerId, value=统计数据 + 元信息
+	creationsCache: Map<string, {
+		voteupCount: number;
+		commentCount: number;
+		collectCount: number;
+		readCount: number;
+		updatedTime: number;   // 知乎最后更新时间（Unix 秒）
+		questionId: string;    // 所属问题 ID
+		title: string;         // 问题标题（用于文件 frontmatter）
+	}> = new Map();
+
+	/**
+	 * 【v2.0.6 恢复】构建 creations/v2/all 缓存
+	 * 用于批量同步时 O(1) 获取统计数据
+	 */
+	async buildCreationsCache(): Promise<void> {
+		new Notice("📦 正在预拉取 creations 缓存...");
+		let offset = 0;
+		const LIMIT = 20;
+		let totalFetched = 0;
+		let maxRetries = 5;
+		let retryCount = 0;
+
+		while (retryCount < maxRetries) {
+			try {
+				const res = await requestUrl({
+					url: `https://www.zhihu.com/api/v4/creators/creations/v2/all?start=0&end=0&limit=${LIMIT}&offset=${offset}&need_co_creation=0&sort_type=updated`,
+					method: "GET",
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+						Cookie: this.settings.cookie,
+					},
+				});
+
+				const data = res.json;
+				const items = data.data || [];
+				const totals = data.paging?.totals || 0;
+
+				for (const item of items) {
+					// 只缓存 answer 类型
+					if (item.type !== "answer") continue;
+					const id = String(item.data?.id);
+					if (!id) continue;
+
+					this.creationsCache.set(id, {
+						voteupCount: item.reaction?.vote_up_count ?? 0,
+						commentCount: item.reaction?.comment_count ?? 0,
+						collectCount: item.reaction?.collect_count ?? 0,
+						readCount: item.reaction?.read_count ?? 0,
+						updatedTime: item.data?.updated_time ?? 0,
+						questionId: String(item.data?.question?.id ?? ""),
+						title: item.data?.question?.title ?? "",
+					});
+				}
+
+				totalFetched += items.length;
+				console.log(`[zhihu-loader] creations 缓存进度: ${totalFetched}/${totals}`);
+
+				// 判断是否结束
+				if (totalFetched >= totals || items.length === 0) break;
+
+				offset += LIMIT;
+				retryCount = 0; // 重置重试计数
+				await new Promise((r) => setTimeout(r, 500));
+			} catch (e: any) {
+				retryCount++;
+				if (e?.status === 403) {
+					console.warn(`[zhihu-loader] creations 缓存 403，重试 (${retryCount}/${maxRetries})...`);
+					await new Promise((r) => setTimeout(r, 3000 * retryCount));
+				} else {
+					console.error("[zhihu-loader] creations 缓存拉取失败:", e);
+					break;
+				}
+			}
+		}
+
+		console.log(`[zhihu-loader] creations 缓存构建完成，共 ${this.creationsCache.size} 条`);
+		new Notice(`📦 缓存构建完成 (${this.creationsCache.size} 条)`);
+	}
+
+	/**
+	 * [阶段二最小化测试] 测试 Electron API 可用性 + 读取 zhihu.com Cookie
+	 * 测试步骤：
+	 * 1. 检查 require('electron') 是否可用
+	 * 2. 尝试读取 session.cookies（zhihu.com 域名）
+	 * 3. 检查 z_c0 cookie 是否存在
+	 * 4. 验证 cookie 有效性（调用知乎 API）
+	 */
+	async testElectronCookie(): Promise<void> {
+		new Notice("🔬 开始 Electron API 测试...");
+
+		// ===== Step 1: 检查 Electron remote =====
+		let electronAvailable = false;
+		let remoteModule: any = null;
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			remoteModule = require("electron").remote;
+			electronAvailable = !!remoteModule;
+			console.log("[CookieTest] ✅ Electron remote 可用:", electronAvailable);
+		} catch (e: any) {
+			console.error("[CookieTest] ❌ Electron remote 不可用:", e?.message || e);
+			new Notice("❌ Electron API 不可用（非桌面环境？）");
+			return;
+		}
+
+		// ===== Step 2: 读取 zhihu.com cookies =====
+		let cookieStore: any = null;
+		let zhihuCookies: any[] = [];
+		try {
+			cookieStore = remoteModule.require("electron").session?.defaultSession?.cookies ||
+				remoteModule.session?.defaultSession?.cookies;
+			if (!cookieStore) {
+				// 尝试另一种路径
+				const { session } = remoteModule.require("electron");
+				cookieStore = session.defaultSession?.cookies;
+			}
+			console.log("[CookieTest] cookieStore 对象:", cookieStore);
+
+			if (cookieStore) {
+				zhihuCookies = await cookieStore.get({ domain: "zhihu.com" });
+				console.log(`[CookieTest] zhihu.com 共 ${zhihuCookies.length} 个 Cookie`);
+				for (const c of zhihuCookies) {
+					console.log(`  - ${c.name}: ${c.value.substring(0, 20)}... (httpOnly=${c.httpOnly}, secure=${c.secure})`);
+				}
+			}
+		} catch (e: any) {
+			console.error("[CookieTest] ❌ 读取 Cookie 失败:", e?.message || e);
+			new Notice("❌ 读取 Cookie 失败: " + (e?.message || "未知错误"));
+		}
+
+		// ===== Step 3: 检查 z_c0 =====
+		const z_c0 = zhihuCookies.find((c) => c.name === "z_c0");
+		if (z_c0) {
+			console.log("[CookieTest] ✅ 找到 z_c0 Cookie，长度:", z_c0.value.length);
+			new Notice("✅ 已登录！z_c0 存在");
+		} else {
+			console.warn("[CookieTest] ⚠️ 未找到 z_c0 Cookie，可能未登录");
+			new Notice("⚠️ 未找到 z_c0，请先在知乎网页登录");
+		}
+
+		// ===== Step 4: 组装完整 Cookie 字符串 =====
+		const cookieStr = zhihuCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+		console.log("[CookieTest] 完整 Cookie 字符串:", cookieStr.substring(0, 100) + "...");
+
+		// ===== Step 5: 验证 Cookie 有效性 =====
+		if (z_c0) {
+			try {
+				const userId = this.settings.zhihuId;
+				const testUrl = userId
+					? `https://www.zhihu.com/api/v4/members/${userId}/answers?limit=1`
+					: "https://www.zhihu.com/api/v4/people/me?include=followee_count,answer_count";
+
+				const res = await requestUrl({
+					url: testUrl,
+					method: "GET",
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+						Cookie: cookieStr,
+					},
+				});
+
+				if (res.status === 200) {
+					console.log("[CookieTest] ✅ Cookie 验证通过！API 返回 200");
+					new Notice("✅ Cookie 有效！API 验证成功");
+					console.log("[CookieTest] 响应预览:", JSON.stringify(res.json)?.substring(0, 200));
+				} else {
+					console.warn(`[CookieTest] ⚠️ API 返回 ${res.status}，Cookie 可能已过期`);
+					new Notice(`⚠️ API 返回 ${res.status}，Cookie 可能过期`);
+				}
+			} catch (e: any) {
+				console.error("[CookieTest] ❌ Cookie 验证失败:", e?.message || e);
+				new Notice("❌ Cookie 验证失败");
+			}
+		}
+
+		// ===== 汇总 =====
+		console.log("[CookieTest] ===== 测试汇总 =====");
+		console.log("1. Electron remote:", electronAvailable ? "✅" : "❌");
+		console.log("2. zhihu.com Cookie 数量:", zhihuCookies.length);
+		console.log("3. z_c0 存在:", z_c0 ? "✅" : "❌");
+		new Notice("🔬 测试完成，请查看 Obsidian Console 查看详细日志");
+	}
 
 	async onload() {
 		await this.loadSettings();
@@ -58,6 +240,13 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			callback: () => this.fetchGoodsRecommendQuestionsV2(),
 		});
 
+		// [TEST] 阶段二最小化测试：Electron API 可用性 + zhihu.com Cookie 检测
+		this.addCommand({
+			id: "test-electron-cookie",
+			name: "[测试] 检测知乎登录状态（Electron）",
+			callback: () => this.testElectronCookie(),
+		});
+
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
 	}
 
@@ -68,50 +257,257 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			return;
 		}
 
-		new Notice("🔍 正在启动增量同步...");
+		new Notice("🔍 正在启动同步...");
 
-		let offset = 0;
-		let isEnd = false;
 		let totalSuccess = 0;
+		let totalSkipped = 0;
+		let totalFailed = 0;
+		let cacheHit = 0;
+		let cacheMiss = 0;
 
 		try {
-			while (!isEnd) {
-				const url = `https://www.zhihu.com/api/v4/members/${userId}/answers?order_by=created&offset=${offset}&limit=20&include=data%5B*%5D.target.question.topics`;
-				const res = await requestUrl({
-					url: url,
-					method: "GET",
-					headers: {
-						Cookie: this.settings.cookie,
-						"User-Agent":
-							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-					},
-				});
+			// ===== 第零步：预拉取 creations 缓存 =====
+			await this.buildCreationsCache();
 
-				const data = res.json;
-				const items = data.data;
-				if (!items || items.length === 0) break;
+			// ===== 第一步：从问答列表翻页获取所有回答ID =====
+			const answerList: Array<{ id: string; questionId: string; updatedTime: number }> = [];
+			let offset = 0;
+			const PAGE_SIZE = 20;
 
-				for (const item of items) {
-					const answerUrl = `https://www.zhihu.com/question/${item.question.id}/answer/${item.id}`;
-					try {
-						const result = await this.fetchZhihuAnswer(answerUrl);
-						if (result === "SKIPPED") {
-							new Notice("✨ 内容已是最新。");
-							isEnd = true;
-							break;
+			new Notice("📝 正在获取回答列表...");
+
+			while (true) {
+				try {
+					const res = await requestUrl({
+						url: `https://www.zhihu.com/api/v4/members/${userId}/answers?offset=${offset}&limit=${PAGE_SIZE}&sort_by=updated&include=question,created_time,updated_time`,
+						method: "GET",
+						headers: {
+							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+							Cookie: this.settings.cookie,
+						},
+					});
+					const data = res.json;
+					const items = data.data || [];
+
+					if (items.length === 0) break;
+
+					for (const item of items) {
+						if (item.id && item.question?.id) {
+							answerList.push({
+								id: String(item.id),
+								questionId: String(item.question.id),
+								updatedTime: item.updated_time || 0,
+							});
 						}
-						if (result === "SUCCESS") totalSuccess++;
-					} catch (err) {
-						console.error(`同步失败: ${answerUrl}`, err);
+					}
+
+					console.log(`[zhihu-loader] 已获取 ${answerList.length} 条回答列表...`);
+
+					if (data.paging?.is_end) break;
+					offset += PAGE_SIZE;
+
+					// 翻页间隔
+					await new Promise((r) => setTimeout(r, 1000));
+				} catch (e: any) {
+					if (e?.status === 403) {
+						console.warn(`[zhihu-loader] 列表翻页 403，等待5秒后重试...`);
+						await new Promise((r) => setTimeout(r, 5000));
+					} else {
+						throw e;
 					}
 				}
-				if (isEnd) break;
-				isEnd = data.paging.is_end;
-				offset += 20;
-				await new Promise((resolve) => setTimeout(resolve, 1000));
 			}
 
-			new Notice(`✅ 回答同步完成！新增: ${totalSuccess} 条`);
+		console.log(`[zhihu-loader] 共获取 ${answerList.length} 条回答，开始同步...`);
+		new Notice(`📝 共 ${answerList.length} 条回答，开始同步...`);
+
+		// 确保目录存在（提前一次性创建）
+		const vault = this.app.vault;
+		const base = this.settings.downloadFolder;
+		const answerDir = `${base}/answers`;
+		const assetDir = `${base}/attachments`;
+		if (!(await vault.adapter.exists(base))) await vault.createFolder(base);
+		if (!(await vault.adapter.exists(answerDir))) await vault.createFolder(answerDir);
+		if (!(await vault.adapter.exists(assetDir))) await vault.createFolder(assetDir);
+
+		// ===== 第二步：遍历每个回答，先本地增量比对，再按需请求 =====
+		for (const answer of answerList) {
+			const answerId = answer.id;
+			const questionId = answer.questionId;
+			const answerUrl = `https://www.zhihu.com/question/${questionId}/answer/${answerId}`;
+
+			// ===== 增量判断（请求前，基于 answerId 命名的本地文件）=====
+			const localPath = `${answerDir}/${answerId}.md`;
+			const localStats = await vault.adapter.stat(localPath);
+			// 用 creations 缓存中的 updatedTime，fallback 到列表中的 updatedTime
+			const cachedEntry = this.creationsCache.get(answerId);
+			const remoteUpdatedTime = cachedEntry?.updatedTime ?? answer.updatedTime ?? 0;
+
+			if (localStats && remoteUpdatedTime && localStats.mtime >= remoteUpdatedTime * 1000) {
+				totalSkipped++;
+				console.log(`[zhihu-loader] 跳过（本地已是最新）: ${answerId}`);
+				continue;  // ← 完全不发任何 API 请求
+			}
+
+			// ===== 需要同步：从缓存获取统计数据 =====
+			let voteupCount = 0;
+			let commentCount = 0;
+			let collectCount = 0;
+			let readCount = 0;
+
+			if (cachedEntry) {
+				voteupCount = cachedEntry.voteupCount;
+				commentCount = cachedEntry.commentCount;
+				collectCount = cachedEntry.collectCount;
+				readCount = cachedEntry.readCount;
+				cacheHit++;
+				console.log(`[zhihu-loader] 缓存命中: ${answerId} - ${voteupCount} 赞`);
+			} else {
+				cacheMiss++;
+			}
+
+			// ===== 发起网络请求：并行获取基本信息 + 正文 =====
+			let retryCount = 0;
+			const maxRetries = 3;
+			let success = false;
+
+			while (retryCount < maxRetries && !success) {
+				try {
+					const [infoRes, contentRes] = await Promise.all([
+						requestUrl({
+							url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=question,author,created_time,updated_time,question.topics`,
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+								Cookie: this.settings.cookie,
+							},
+						}),
+						requestUrl({
+							url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content`,
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+								Cookie: this.settings.cookie,
+							},
+						}),
+					]);
+
+					const infoText = infoRes.text;
+					const contentText = contentRes.text;
+					if (!infoText || !contentText) {
+						console.error("[zhihu-loader] 空响应，answerId:", answerId);
+						throw new Error("空响应");
+					}
+					let info: any, contentData: any;
+					try { info = JSON.parse(infoText); } catch { throw new Error(`infoRes 非JSON: ${infoText.substring(0, 100)}`); }
+					try { contentData = JSON.parse(contentText); } catch { throw new Error(`contentRes 非JSON: ${contentText.substring(0, 100)}`); }
+					if (info.error) throw new Error(`回答已删除: ${info.error.message}`);
+
+					const answerContent = contentData.content || "";
+					const apiTitle = info.question?.title || "无标题";
+
+					// 缓存未命中时：用问题回答列表翻页获取统计数据
+					if (!cachedEntry) {
+						let found = false;
+						for (let pageOffset = 0; pageOffset < 200 && !found; pageOffset += 20) {
+							try {
+								const listRes = await requestUrl({
+									url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${pageOffset}&sort_by=created_time`,
+									method: "GET",
+									headers: {
+										"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+										Cookie: this.settings.cookie,
+									},
+								});
+								const listData = listRes.json;
+								const match = listData.data?.find((a: any) => String(a.id) === answerId);
+								if (match) {
+									voteupCount = match.voteup_count ?? 0;
+									commentCount = match.comment_count ?? 0;
+									found = true;
+									console.log(`[zhihu-loader] 翻页命中: ${answerId} - ${voteupCount} 赞`);
+								}
+								if (listData.paging?.is_end) break;
+							} catch (e) {
+								console.warn(`[zhihu-loader] 问题列表翻页失败:`, e);
+								break;
+							}
+						}
+
+						// 第三级：link_card_infos 兜底
+						if (!found) {
+							try {
+								const cardUrl = encodeURIComponent(answerUrl);
+								const cardRes = await requestUrl({
+									url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${cardUrl}`,
+									method: "GET",
+									headers: {
+										"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+										Cookie: this.settings.cookie,
+									},
+								});
+								const cardText = cardRes.text;
+								if (cardText) {
+									const cardData = JSON.parse(cardText);
+									const firstUrl = Object.keys(cardData)[0];
+									const cardInfo = firstUrl ? cardData[firstUrl] : null;
+									if (cardInfo?.extra_info) {
+										const extraInfo = JSON.parse(cardInfo.extra_info);
+										const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
+										const voteupMatch = desc.match(/(\d+)\s*赞同/);
+										const commentMatch = desc.match(/(\d+)\s*评论/);
+										if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
+										if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
+										console.log(`[zhihu-loader] link_card_infos 兜底: ${desc}`);
+									}
+								}
+							} catch (e) {
+								console.warn(`[zhihu-loader] link_card_infos 获取失败:`, e);
+							}
+						}
+					}
+
+					// 处理正文和图片（文件名使用 answerId）
+					const result = await this.processAndSaveAnswer({
+						answerId,
+						questionId,
+						answerUrl,
+						apiTitle,
+						answerContent,
+						voteupCount,
+						commentCount,
+						collectCount,
+						readCount,
+						info,
+						path: localPath,
+						assetDir,
+					});
+
+					if (result === "SUCCESS") totalSuccess++;
+					else if (result === "SKIPPED") totalSkipped++;
+					else totalFailed++;
+
+					success = true;
+					// 实际发出请求后，间隔 3s 避免限流
+					await new Promise((resolve) => setTimeout(resolve, 3000));
+				} catch (err: any) {
+					retryCount++;
+					if (err?.status === 403 && retryCount < maxRetries) {
+						const delay = 5000 * retryCount;
+						console.warn(`[zhihu-loader] ⚠️ 403限流，${delay}ms后重试(${retryCount}/${maxRetries})`);
+						await new Promise((r) => setTimeout(r, delay));
+					} else {
+						console.error(`[zhihu-loader] 同步失败:`, err);
+						totalFailed++;
+						success = true;
+					}
+				}
+			}
+
+			}
+		// 注意：间隔 3s 已在内部 while 循环结束后自然等待，跳过的条目不等待
+
+			new Notice(`✅ 回答同步完成！新增: ${totalSuccess}，跳过: ${totalSkipped}，失败: ${totalFailed}（缓存命中: ${cacheHit}，未命中: ${cacheMiss}）`);
 
 			if (this.settings.enableRecommendSync)
 				await this.fetchCreatorRecommendQuestions();
@@ -358,162 +754,30 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	}
 
 	/**
-	 * 回答抓取核心逻辑 (带图片本地化)
-	 * v2.0.4: 修复统计数据 undefined 问题，增强健壮性
+	 * 处理正文并保存回答文件（批量同步和单篇导入共用）
 	 */
-	async fetchZhihuAnswer(
-		cleanUrl: string,
-	): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
-		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
-		if (!answerId) return "FAILED";
-
-		let voteupCount = 0,
-			commentCount = 0,
-			collectCount = 0,
-			readCount = 0;
+	async processAndSaveAnswer(params: {
+		answerId: string;
+		questionId: string;
+		answerUrl: string;
+		apiTitle: string;
+		answerContent: string;
+		voteupCount: number;
+		commentCount: number;
+		collectCount?: number;
+		readCount?: number;
+		info: any;
+		path: string;
+		assetDir: string;
+	}): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
+		const { answerId, answerUrl, apiTitle, answerContent, voteupCount, commentCount, collectCount = 0, readCount = 0, info, path, assetDir } = params;
 
 		try {
-			// ========== 第一阶段：获取基本信息（不包含 voteup_count 等统计字段） ==========
-			const infoRes = await requestUrl({
-				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=question,author,created_time,updated_time,question.topics`,
-				method: "GET",
-				headers: {
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-					Cookie: this.settings.cookie,
-				},
-			});
-			const info = infoRes.json;
-
-			// ========== 第二阶段：获取统计数据 ==========
-			// 策略：优先使用 creations/v2/all（返回结构化字段），失败则降级到 link_card_infos（从 desc 解析）
-			let statsFromCreations = false;
-			
-			// 方案A：尝试 creations/v2/all API（需要正确设置时间范围）
-			try {
-				const authorId = info.author?.id || info.author?.url_token;
-				
-				if (authorId) {
-					// 估算回答的创建时间范围：往前推5年，足够覆盖绝大多数回答
-					const now = Math.floor(Date.now() / 1000);
-					const fiveYearsAgo = now - 5 * 365 * 24 * 60 * 60;
-					
-					// 使用更大的 limit，并尝试不同的 offset
-					for (let attempt = 0; attempt < 3; attempt++) {
-						const offset = attempt * 500;
-						const creationsRes = await requestUrl({
-							url: `https://www.zhihu.com/api/v4/creators/creations/v2/all?start=${now}&end=${fiveYearsAgo}&limit=500&offset=${offset}&need_co_creation=1&sort_type=created`,
-							method: "GET",
-							headers: {
-								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-								Cookie: this.settings.cookie,
-							},
-						});
-						const creationsData = creationsRes.json;
-						const dataList = creationsData.data || [];
-						
-						console.log(`[zhihu-loader] creations/v2/all: 获取到 ${dataList.length} 条数据`);
-						
-						// 正确的数据结构：统计字段在 reaction 对象里
-						// { type: "answer", data: { id: "xxx" }, reaction: { vote_up_count, comment_count, ... } }
-						if (dataList.length > 0) {
-							// 检查是否是正确的数据结构（有 reaction 字段）
-							const hasReaction = dataList.some((item: any) => item.reaction?.vote_up_count !== undefined);
-							if (hasReaction) {
-								const answerData = dataList.find(
-									(item: any) => item.type === "answer" && String(item.data?.id) === String(answerId)
-								);
-								if (answerData) {
-									voteupCount = answerData.reaction?.vote_up_count || 0;
-									commentCount = answerData.reaction?.comment_count || 0;
-									collectCount = answerData.reaction?.collect_count || 0;
-									readCount = answerData.reaction?.read_count || 0;
-									statsFromCreations = true;
-									console.log(`[zhihu-loader] ✓ 从creations获取: voteup=${voteupCount}, comment=${commentCount}, collect=${collectCount}, read=${readCount}`);
-									break;
-								}
-							} else {
-								// creations/v2/all 没有统计字段，说明API结构变了
-								console.log(`[zhihu-loader] creations/v2/all 无reaction字段，跳过`);
-								break;
-							}
-						}
-					}
-				}
-			} catch (e) {
-				console.warn(`[zhihu-loader] creations/v2/all 请求失败:`, e);
-			}
-
-			// 方案B：降级到 link_card_infos API（从 extra_info.desc 解析）
-			if (!statsFromCreations) {
-				try {
-					const answerUrl = encodeURIComponent(`https://www.zhihu.com/question/${info.question?.id}/answer/${answerId}`);
-					const cardRes = await requestUrl({
-						url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${answerUrl}`,
-						method: "GET",
-						headers: {
-							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-							Cookie: this.settings.cookie,
-						},
-					});
-					const cardData = cardRes.json;
-					
-				// 获取第一个 URL 的 extra_info（cardData 是对象，键是 URL）
-				const firstUrl = Object.keys(cardData)[0];
-				const cardInfo = firstUrl ? cardData[firstUrl] : null;
-				
-				if (cardInfo?.extra_info) {
-					const extraInfo = JSON.parse(cardInfo.extra_info);
-					const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
-					console.log(`[zhihu-loader] link_card_infos: ${desc}`);
-					
-					// 解析格式："222 赞同 · 81 评论"
-					const voteupMatch = desc.match(/(\d+)\s*赞同/);
-					const commentMatch = desc.match(/(\d+)\s*评论/);
-					if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
-					if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
-				}
-				} catch (e) {
-					console.warn(`[zhihu-loader] link_card_infos 请求失败:`, e);
-				}
-			}
-
-			// 第三步：获取回答正文内容
-			const contentRes = await requestUrl({
-				url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content`,
-				method: "GET",
-				headers: {
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-					Cookie: this.settings.cookie,
-				},
-			});
-			const contentData = contentRes.json;
-
-			const apiTitle = info.question.title;
 			const vault = this.app.vault;
-			const base = this.settings.downloadFolder;
-			const answerDir = `${base}/answers`;
-			const assetDir = `${base}/attachments`;
 
-			if (!(await vault.adapter.exists(base)))
-				await vault.createFolder(base);
-			if (!(await vault.adapter.exists(answerDir)))
-				await vault.createFolder(answerDir);
-			if (!(await vault.adapter.exists(assetDir)))
-				await vault.createFolder(assetDir);
-
-			const safeName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
-			const path = `${answerDir}/${safeName}.md`;
-			const stats = await vault.adapter.stat(path);
-			if (stats && stats.mtime >= info.updated_time * 1000)
-				return "SKIPPED";
-
+			// 处理图片本地化
 			const parser = new DOMParser();
-			const doc = parser.parseFromString(
-				contentData.content,
-				"text/html",
-			);
+			const doc = parser.parseFromString(answerContent, "text/html");
 			const imgs = Array.from(doc.querySelectorAll("img"));
 			const processed = new Set<string>();
 			let idx = 0;
@@ -527,8 +791,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					img.remove();
 					continue;
 				}
-				let hd = src
-					.split("?")[0]
+				let hd = (src.split("?")[0] ?? src)
 					.replace(/_[a-z0-9]+(\.(jpg|png|webp|jpeg|gif))/gi, "$1");
 				const id = hd.split("/").pop() || hd;
 				if (processed.has(id)) continue;
@@ -537,10 +800,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					const res = await requestUrl({ url: hd, method: "GET" });
 					const ext = hd.split(".").pop() || "jpg";
 					const name = `zhihu_${answerId}_${idx}.${ext}`;
-					await vault.createBinary(
-						`${assetDir}/${name}`,
-						res.arrayBuffer,
-					);
+					await vault.createBinary(`${assetDir}/${name}`, res.arrayBuffer);
 					img.setAttribute("src", name);
 					processed.add(id);
 					idx++;
@@ -549,6 +809,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				}
 			}
 
+			// 转换为 Markdown
 			const turndown = new TurndownService({
 				headingStyle: "atx",
 				bulletListMarker: "-",
@@ -557,30 +818,28 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				filter: "img",
 				replacement: (content, node: any) => {
 					const s = node.getAttribute("src");
-					// 只处理本地化后的文件名（不含协议头），跳过 data URI 和 http 链接
 					if (!s || s.startsWith("http") || s.startsWith("data:"))
 						return "";
 					return `![[${s}]]`;
 				},
 			});
 			const body = turndown.turndown(doc.body.innerHTML);
-			const topics =
-				info.question.topics
-					?.map((t: any) => `'[[${t.name}]]'`)
-					.join(", ") || "";
+			const topics = (info.question?.topics || [])
+				.map((t: any) => `'[[${t.name}]]'`)
+				.join(", ") || "";
 
 			const content = [
 				`---`,
 				`标题: "${apiTitle.replace(/"/g, '\\"')}"`,
-				`url: ${cleanUrl}`,
+				`url: ${answerUrl}`,
 				`话题: [${topics}]`,
 				`点赞数: ${voteupCount}`,
 				`评论数: ${commentCount}`,
 				`收藏数: ${collectCount}`,
 				`阅读数: ${readCount}`,
 				`作者: ${info.author?.name ?? ""}`,
-				`日期: ${new Date(info.created_time * 1000).toISOString().split("T")[0]}`,
-				`更新: ${new Date(info.updated_time * 1000).toISOString().split("T")[0]}`,
+				`日期: ${info.created_time ? new Date(info.created_time * 1000).toISOString().split("T")[0] : ""}`,
+				`更新: ${info.updated_time ? new Date(info.updated_time * 1000).toISOString().split("T")[0] : ""}`,
 				`---`,
 				`# ${apiTitle}\n\n${body}`,
 			].join("\n");
@@ -588,8 +847,194 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const file = vault.getAbstractFileByPath(path);
 			if (file instanceof TFile) await vault.modify(file, content);
 			else await vault.create(path, content);
+
 			return "SUCCESS";
 		} catch (error) {
+			console.error(`[zhihu-loader] 保存回答失败:`, error);
+			return "FAILED";
+		}
+	}
+
+	/**
+	 * 单篇回答导入（用于"导入单个回答"功能）
+	 * 使用 link_card_infos 获取统计数据
+	 */
+	async fetchZhihuAnswer(
+		cleanUrl: string,
+	): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
+		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
+		if (!answerId) {
+			new Notice("❌ 链接格式错误，请确认是知乎回答链接");
+			return "FAILED";
+		}
+
+		new Notice("🔍 正在获取回答...");
+
+		try {
+			// 并行请求：基本信息 + 正文内容
+			const [infoRes, contentRes] = await Promise.all([
+				requestUrl({
+					url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=question,author,created_time,updated_time,question.topics`,
+					method: "GET",
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+						Cookie: this.settings.cookie,
+					},
+				}),
+				requestUrl({
+					url: `https://www.zhihu.com/api/v4/answers/${answerId}?include=content`,
+					method: "GET",
+					headers: {
+						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+						Cookie: this.settings.cookie,
+					},
+				}),
+			]);
+
+			// 检查响应是否有效（防止验证码页面等非JSON响应）
+			const infoText = infoRes.text;
+			const contentText = contentRes.text;
+
+			if (!infoText || !contentText) {
+				new Notice("❌ 获取失败：空响应，请检查 Cookie");
+				return "FAILED";
+			}
+
+			let info: any, contentData: any;
+			try {
+				info = JSON.parse(infoText);
+			} catch {
+				new Notice("❌ 获取失败：知乎返回非JSON响应（可能被风控）");
+				console.error("[zhihu-loader] infoRes 非JSON:", infoText.substring(0, 200));
+				return "FAILED";
+			}
+			try {
+				contentData = JSON.parse(contentText);
+			} catch {
+				new Notice("❌ 获取失败：正文返回非JSON响应（可能被风控）");
+				console.error("[zhihu-loader] contentRes 非JSON:", contentText.substring(0, 200));
+				return "FAILED";
+			}
+
+			// 检查是否是错误响应
+			if (info.error) {
+				new Notice(`❌ 回答不存在或已被删除 (${info.error.message})`);
+				return "FAILED";
+			}
+
+			const answerContent = contentData.content || "";
+			const questionId = info.question?.id;
+			const apiTitle = info.question?.title || "无标题";
+
+			// ===== 统计数据：三级降级策略 =====
+			let voteupCount = 0;
+			let commentCount = 0;
+			let collectCount = 0;
+			let readCount = 0;
+
+			// 第一级：查询缓存
+			const cachedStats = this.creationsCache.get(answerId);
+			if (cachedStats) {
+				voteupCount = cachedStats.voteupCount;
+				commentCount = cachedStats.commentCount;
+				collectCount = cachedStats.collectCount;
+				readCount = cachedStats.readCount;
+				console.log(`[zhihu-loader] 单篇缓存命中: ${answerId} - ${voteupCount} 赞`);
+			} else {
+				// 第二级：问题回答列表翻页
+				let found = false;
+				for (let pageOffset = 0; pageOffset < 200 && !found; pageOffset += 20) {
+					try {
+						const listRes = await requestUrl({
+							url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${pageOffset}&sort_by=created_time`,
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+								Cookie: this.settings.cookie,
+							},
+						});
+						const listData = listRes.json;
+						const match = listData.data?.find((a: any) => String(a.id) === answerId);
+						if (match) {
+							voteupCount = match.voteup_count ?? 0;
+							commentCount = match.comment_count ?? 0;
+							found = true;
+							console.log(`[zhihu-loader] 单篇翻页命中: ${answerId} - ${voteupCount} 赞`);
+						}
+						if (listData.paging?.is_end) break;
+					} catch (e) {
+						console.warn(`[zhihu-loader] 问题列表翻页失败:`, e);
+						break;
+					}
+				}
+
+				// 第三级：link_card_infos 兜底
+				if (!found) {
+					try {
+						const cardUrl = encodeURIComponent(cleanUrl);
+						const cardRes = await requestUrl({
+							url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${cardUrl}`,
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+								Cookie: this.settings.cookie,
+							},
+						});
+						const cardText = cardRes.text;
+						if (cardText) {
+							const cardData = JSON.parse(cardText);
+							const firstUrl = Object.keys(cardData)[0];
+							const cardInfo = firstUrl ? cardData[firstUrl] : null;
+							if (cardInfo?.extra_info) {
+								const extraInfo = JSON.parse(cardInfo.extra_info);
+								const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
+								const voteupMatch = desc.match(/(\d+)\s*赞同/);
+								const commentMatch = desc.match(/(\d+)\s*评论/);
+								if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
+								if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
+								console.log(`[zhihu-loader] link_card_infos 兜底: ${desc}`);
+							}
+						}
+					} catch (e) {
+						console.warn(`[zhihu-loader] link_card_infos 获取失败:`, e);
+					}
+				}
+			}
+
+			// 增量判断
+			const vault = this.app.vault;
+			const base = this.settings.downloadFolder;
+			const answerDir = `${base}/answers`;
+			const assetDir = `${base}/attachments`;
+
+			if (!(await vault.adapter.exists(base))) await vault.createFolder(base);
+			if (!(await vault.adapter.exists(answerDir))) await vault.createFolder(answerDir);
+			if (!(await vault.adapter.exists(assetDir))) await vault.createFolder(assetDir);
+
+			const safeName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
+			const path = `${answerDir}/${safeName}.md`;
+			const stats = await vault.adapter.stat(path);
+
+			if (stats && info.updated_time && stats.mtime >= info.updated_time * 1000) {
+				return "SKIPPED";
+			}
+
+			return await this.processAndSaveAnswer({
+				answerId,
+				questionId: questionId || "",
+				answerUrl: cleanUrl,
+				apiTitle,
+				answerContent,
+				voteupCount,
+				commentCount,
+				collectCount,
+				readCount,
+				info,
+				path,
+				assetDir,
+			});
+		} catch (error) {
+			console.error(`[zhihu-loader] 单篇导入失败:`, error);
 			return "FAILED";
 		}
 	}
