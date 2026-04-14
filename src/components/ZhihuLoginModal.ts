@@ -3,7 +3,7 @@ import { Modal, Notice, App } from "obsidian";
 // 知乎登录弹窗：创建 BrowserWindow 加载知乎登录页，轮询检测 z_c0 Cookie
 export class ZhihuLoginModal extends Modal {
 	app: App;
-	onSuccess: (cookie: string, userName?: string, avatarUrl?: string) => void;
+	onSuccess: (cookie: string, userName?: string, peopleId?: string, avatarUrl?: string) => void;
 	onCancel: () => void;
 
 	private checkInterval: number | null = null;

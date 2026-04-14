@@ -1,48 +1,30 @@
 import {
 	App,
-	Modal,
 	Notice,
 	Plugin,
-	PluginSettingTab,
-	Setting,
 	requestUrl,
 	TFile,
 } from "obsidian";
 import TurndownService from "turndown";
 import { ZhihuLoginModal } from "./components/ZhihuLoginModal";
-
-interface ZhihuSettings {
-	downloadFolder: string;
-	cookie: string;
-	zhihuId: string;
-	enableRecommendSync: boolean;
-	enableGoodsSync: boolean;
-	userName?: string;
-	userAvatar?: string;
-	cookieValidUntil?: number;
-}
-
-const DEFAULT_SETTINGS: ZhihuSettings = {
-	downloadFolder: "Zhihu_Imports",
-	cookie: "",
-	zhihuId: "",
-	enableRecommendSync: false,
-	enableGoodsSync: false,
-};
+import { ZhihuSettingTab, ImportModal } from "./ui/ZhihuSettingTab";
+import type {
+	AnswerListItem,
+	AnswerStats,
+	CreationsCacheEntry,
+	ProcessAnswerParams,
+	SyncResult,
+	ZhihuSettings,
+} from "./types";
+import { DEFAULT_SETTINGS } from "./types";
+import { fetchAnswerStats } from "./stats";
+import { sanitizeTitle } from "./sanitize";
 
 export default class ZhihuLoaderPlugin extends Plugin {
 	settings: ZhihuSettings;
 	settingTab?: ZhihuSettingTab;
 	// creations 缓存：key=answerId, value=统计数据 + 元信息
-	creationsCache: Map<string, {
-		voteupCount: number;
-		commentCount: number;
-		collectCount: number;
-		readCount: number;
-		updatedTime: number;   // 知乎最后更新时间（Unix 秒）
-		questionId: string;    // 所属问题 ID
-		title: string;         // 问题标题（用于文件 frontmatter）
-	}> = new Map();
+	creationsCache: Map<string, CreationsCacheEntry> = new Map();
 
 	/**
 	 * 【v2.0.6 恢复】构建 creations/v2/all 缓存
@@ -237,101 +219,6 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	 * 3. 检查 z_c0 cookie 是否存在
 	 * 4. 验证 cookie 有效性（调用知乎 API）
 	 */
-	async testElectronCookie(): Promise<void> {
-		new Notice("🔬 开始 Electron API 测试...");
-
-		// ===== Step 1: 检查 Electron remote =====
-		let electronAvailable = false;
-		let remoteModule: any = null;
-		try {
-			// eslint-disable-next-line @typescript-eslint/no-var-requires
-			remoteModule = require("electron").remote;
-			electronAvailable = !!remoteModule;
-			console.log("[CookieTest] ✅ Electron remote 可用:", electronAvailable);
-		} catch (e: any) {
-			console.error("[CookieTest] ❌ Electron remote 不可用:", e?.message || e);
-			new Notice("❌ Electron API 不可用（非桌面环境？）");
-			return;
-		}
-
-		// ===== Step 2: 读取 zhihu.com cookies =====
-		let cookieStore: any = null;
-		let zhihuCookies: any[] = [];
-		try {
-			cookieStore = remoteModule.require("electron").session?.defaultSession?.cookies ||
-				remoteModule.session?.defaultSession?.cookies;
-			if (!cookieStore) {
-				// 尝试另一种路径
-				const { session } = remoteModule.require("electron");
-				cookieStore = session.defaultSession?.cookies;
-			}
-			console.log("[CookieTest] cookieStore 对象:", cookieStore);
-
-			if (cookieStore) {
-				zhihuCookies = await cookieStore.get({ domain: "zhihu.com" });
-				console.log(`[CookieTest] zhihu.com 共 ${zhihuCookies.length} 个 Cookie`);
-				for (const c of zhihuCookies) {
-					console.log(`  - ${c.name}: ${c.value.substring(0, 20)}... (httpOnly=${c.httpOnly}, secure=${c.secure})`);
-				}
-			}
-		} catch (e: any) {
-			console.error("[CookieTest] ❌ 读取 Cookie 失败:", e?.message || e);
-			new Notice("❌ 读取 Cookie 失败: " + (e?.message || "未知错误"));
-		}
-
-		// ===== Step 3: 检查 z_c0 =====
-		const z_c0 = zhihuCookies.find((c) => c.name === "z_c0");
-		if (z_c0) {
-			console.log("[CookieTest] ✅ 找到 z_c0 Cookie，长度:", z_c0.value.length);
-			new Notice("✅ 已登录！z_c0 存在");
-		} else {
-			console.warn("[CookieTest] ⚠️ 未找到 z_c0 Cookie，可能未登录");
-			new Notice("⚠️ 未找到 z_c0，请先在知乎网页登录");
-		}
-
-		// ===== Step 4: 组装完整 Cookie 字符串 =====
-		const cookieStr = zhihuCookies.map((c) => `${c.name}=${c.value}`).join("; ");
-		console.log("[CookieTest] 完整 Cookie 字符串:", cookieStr.substring(0, 100) + "...");
-
-		// ===== Step 5: 验证 Cookie 有效性 =====
-		if (z_c0) {
-			try {
-				const userId = this.settings.zhihuId;
-				const testUrl = userId
-					? `https://www.zhihu.com/api/v4/members/${userId}/answers?limit=1`
-					: "https://www.zhihu.com/api/v4/people/me?include=followee_count,answer_count";
-
-				const res = await requestUrl({
-					url: testUrl,
-					method: "GET",
-					headers: {
-						"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-						Cookie: cookieStr,
-					},
-				});
-
-				if (res.status === 200) {
-					console.log("[CookieTest] ✅ Cookie 验证通过！API 返回 200");
-					new Notice("✅ Cookie 有效！API 验证成功");
-					console.log("[CookieTest] 响应预览:", JSON.stringify(res.json)?.substring(0, 200));
-				} else {
-					console.warn(`[CookieTest] ⚠️ API 返回 ${res.status}，Cookie 可能已过期`);
-					new Notice(`⚠️ API 返回 ${res.status}，Cookie 可能过期`);
-				}
-			} catch (e: any) {
-				console.error("[CookieTest] ❌ Cookie 验证失败:", e?.message || e);
-				new Notice("❌ Cookie 验证失败");
-			}
-		}
-
-		// ===== 汇总 =====
-		console.log("[CookieTest] ===== 测试汇总 =====");
-		console.log("1. Electron remote:", electronAvailable ? "✅" : "❌");
-		console.log("2. zhihu.com Cookie 数量:", zhihuCookies.length);
-		console.log("3. z_c0 存在:", z_c0 ? "✅" : "❌");
-		new Notice("🔬 测试完成，请查看 Obsidian Console 查看详细日志");
-	}
-
 	async onload() {
 		await this.loadSettings();
 
@@ -358,14 +245,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		this.addCommand({
 			id: "fetch-zhihu-goods-recommendation-v2",
 			name: "获取今日好物推荐问题（新版含详细信息）",
-			callback: () => this.fetchGoodsRecommendQuestionsV2(),
-		});
-
-		// [TEST] 阶段二最小化测试：Electron API 可用性 + zhihu.com Cookie 检测
-		this.addCommand({
-			id: "test-electron-cookie",
-			name: "[测试] 检测知乎登录状态（Electron）",
-			callback: () => this.testElectronCookie(),
+			callback: () => this.fetchGoodsRecommendQuestions(),
 		});
 
 		this.addSettingTab(new ZhihuSettingTab(this.app, this));
@@ -391,7 +271,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			await this.buildCreationsCache();
 
 			// ===== 第一步：从问答列表翻页获取所有回答ID =====
-			const answerList: Array<{ id: string; questionId: string; updatedTime: number; title: string }> = [];
+			const answerList: AnswerListItem[] = [];
 			let offset = 0;
 			const PAGE_SIZE = 20;
 
@@ -464,13 +344,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const cachedEntry = this.creationsCache.get(answerId);
 			const apiTitle = cachedEntry?.title || answer.title;
 
-			// ===== 文件名用回答标题（sanitize 处理特殊字符）=====
-			// 规则：问号全部保留，只替换文件系统非法字符和 Obsidian 特殊字符
-			const safeTitle = apiTitle
-				.replace(/[\\/:*?"<>|#\[\]]/g, "_")  // 替换非法字符为下划线（问号保留）
-				.replace(/_+/g, "_")                  // 合并连续下划线
-				.replace(/^_|_$/g, "")                 // 去除首尾下划线
-				.substring(0, 120);                    // 截断
+		// ===== 文件名用回答标题（sanitize 处理特殊字符）=====
+		const safeTitle = sanitizeTitle(apiTitle);
 
 			// ===== 增量判断（请求前，基于标题命名的本地文件）=====
 			const localPath = `${answerDir}/${safeTitle}.md`;
@@ -543,65 +418,13 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				// 优先使用已缓存的标题，API 返回的 title 作为兜底
 				const finalTitle = apiTitle || info.question?.title || "无标题";
 
-					// 缓存未命中时：用问题回答列表翻页获取统计数据
+					// 缓存未命中时：用三级降级策略获取统计数据
 					if (!cachedEntry) {
-						let found = false;
-						for (let pageOffset = 0; pageOffset < 200 && !found; pageOffset += 20) {
-							try {
-								const listRes = await requestUrl({
-									url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${pageOffset}&sort_by=created_time`,
-									method: "GET",
-									headers: {
-										"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-										Cookie: this.settings.cookie,
-									},
-								});
-								const listData = listRes.json;
-								const match = listData.data?.find((a: any) => String(a.id) === answerId);
-								if (match) {
-									voteupCount = match.voteup_count ?? 0;
-									commentCount = match.comment_count ?? 0;
-									found = true;
-									console.log(`[zhihu-loader] 翻页命中: ${answerId} - ${voteupCount} 赞`);
-								}
-								if (listData.paging?.is_end) break;
-							} catch (e) {
-								console.warn(`[zhihu-loader] 问题列表翻页失败:`, e);
-								break;
-							}
-						}
-
-						// 第三级：link_card_infos 兜底
-						if (!found) {
-							try {
-								const cardUrl = encodeURIComponent(answerUrl);
-								const cardRes = await requestUrl({
-									url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${cardUrl}`,
-									method: "GET",
-									headers: {
-										"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-										Cookie: this.settings.cookie,
-									},
-								});
-								const cardText = cardRes.text;
-								if (cardText) {
-									const cardData = JSON.parse(cardText);
-									const firstUrl = Object.keys(cardData)[0];
-									const cardInfo = firstUrl ? cardData[firstUrl] : null;
-									if (cardInfo?.extra_info) {
-										const extraInfo = JSON.parse(cardInfo.extra_info);
-										const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
-										const voteupMatch = desc.match(/(\d+)\s*赞同/);
-										const commentMatch = desc.match(/(\d+)\s*评论/);
-										if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
-										if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
-										console.log(`[zhihu-loader] link_card_infos 兜底: ${desc}`);
-									}
-								}
-							} catch (e) {
-								console.warn(`[zhihu-loader] link_card_infos 获取失败:`, e);
-							}
-						}
+						const stats = await fetchAnswerStats(answerId, questionId, answerUrl, this.settings.cookie, undefined);
+						voteupCount = stats.voteupCount;
+						commentCount = stats.commentCount;
+						collectCount = stats.collectCount;
+						readCount = stats.readCount;
 					}
 
 				// 处理正文和图片（文件名使用回答标题）
@@ -649,89 +472,18 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			if (this.settings.enableRecommendSync)
 				await this.fetchCreatorRecommendQuestions();
 			if (this.settings.enableGoodsSync)
-				await this.fetchGoodsRecommendQuestionsV2();
+				await this.fetchGoodsRecommendQuestions();
 		} catch (e) {
 			new Notice("❌ 同步中断！请检查 Cookie");
 		}
 	}
 
 	/**
-	 * 【2.0.2 修复】好物推荐抓取 - 修正 Token 映射链接逻辑
-	 */
-	async fetchGoodsRecommendQuestions() {
-		if (!this.settings.cookie) {
-			new Notice("⚠️ 请先设置知乎 Cookie");
-			return;
-		}
-
-		try {
-			const url =
-				"https://www.zhihu.com/api/v4/mcn/recommend/question?tab_id=0&offset=0&limit=20";
-
-			const res = await requestUrl({
-				url: url,
-				method: "GET",
-				headers: {
-					Cookie: this.settings.cookie,
-					"User-Agent":
-						"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-					Referer:
-						"https://www.zhihu.com/creator/content-growth/mcn-question",
-				},
-			});
-
-			const items = res.json.data;
-			if (!items || items.length === 0) {
-				new Notice("⚠️ 好物列表为空");
-				return;
-			}
-
-			const vault = this.app.vault;
-			const base = this.settings.downloadFolder;
-			const goodsPath = `${base}/Goods`;
-
-			if (!(await vault.adapter.exists(base)))
-				await vault.createFolder(base);
-			if (!(await vault.adapter.exists(goodsPath)))
-				await vault.createFolder(goodsPath);
-
-			let md = `## 知乎好物推荐列表 (${new Date().toLocaleDateString()})\n\n`;
-			md +=
-				"| 问题标题 | 回答数 | 浏览量 | 链接 |\n| :--- | :--- | :--- | :--- |\n";
-
-			items.forEach((item: any) => {
-				const questionId =
-					item.token || (item.question && item.question.id);
-				if (!questionId || !item.title) return;
-
-				const title = item.title.replace(/\|/g, "\\|");
-				const link = `https://www.zhihu.com/question/${questionId}`;
-				const answers = item.answer_count || 0;
-				const views = item.visit_count || "N/A";
-
-				md += `| ${title} | ${answers} | ${views} | [直达问题](${link}) |\n`;
-			});
-
-			const fileName = `${goodsPath}/好物推荐_${new Date().toISOString().split("T")[0]}.md`;
-			const file = vault.getAbstractFileByPath(fileName);
-
-			if (file instanceof TFile) await vault.modify(file, md);
-			else await vault.create(fileName, md);
-
-			new Notice("✅ 好物清单链接已修正，同步成功");
-		} catch (e) {
-			console.error("Goods Sync Error:", e);
-			new Notice("❌ 好物推荐抓取失败");
-		}
-	}
-
-	/**
-	 * 【2.0.3 新增】好物推荐抓取 v2 - 使用新 API 端点，获取完整问题信息
-	 * 新端点: /api/v4/creators/question_route/author_related/goods
-	 * 新增字段: answer_count, visit_count, follower_count, created(问题创建时间)
+	 * 好物推荐抓取 - 使用 /api/v4/creators/question_route/author_related/goods 端点
+	 * 获取完整问题信息：answer_count, visit_count, follower_count, created(问题创建时间)
 	 * 链接直接使用 API 返回的 question.url
 	 */
-	async fetchGoodsRecommendQuestionsV2() {
+	async fetchGoodsRecommendQuestions() {
 		if (!this.settings.cookie) {
 			new Notice("⚠️ 请先设置知乎 Cookie");
 			return;
@@ -893,20 +645,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	/**
 	 * 处理正文并保存回答文件（批量同步和单篇导入共用）
 	 */
-	async processAndSaveAnswer(params: {
-		answerId: string;
-		questionId: string;
-		answerUrl: string;
-		apiTitle: string;
-		answerContent: string;
-		voteupCount: number;
-		commentCount: number;
-		collectCount?: number;
-		readCount?: number;
-		info: any;
-		path: string;
-		assetDir: string;
-	}): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
+	async processAndSaveAnswer(params: ProcessAnswerParams): Promise<SyncResult> {
 		const { answerId, answerUrl, apiTitle, answerContent, voteupCount, commentCount, collectCount = 0, readCount = 0, info, path, assetDir } = params;
 
 		try {
@@ -996,9 +735,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 	 * 单篇回答导入（用于"导入单个回答"功能）
 	 * 使用 link_card_infos 获取统计数据
 	 */
-	async fetchZhihuAnswer(
-		cleanUrl: string,
-	): Promise<"SUCCESS" | "SKIPPED" | "FAILED"> {
+	async fetchZhihuAnswer(cleanUrl: string): Promise<SyncResult> {
 		const answerId = cleanUrl.match(/answer\/(\d+)/)?.[1];
 		if (!answerId) {
 			new Notice("❌ 链接格式错误，请确认是知乎回答链接");
@@ -1069,74 +806,19 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			let collectCount = 0;
 			let readCount = 0;
 
-			// 第一级：查询缓存
+			// 使用统一的三级降级策略获取统计数据
 			const cachedStats = this.creationsCache.get(answerId);
-			if (cachedStats) {
-				voteupCount = cachedStats.voteupCount;
-				commentCount = cachedStats.commentCount;
-				collectCount = cachedStats.collectCount;
-				readCount = cachedStats.readCount;
-				console.log(`[zhihu-loader] 单篇缓存命中: ${answerId} - ${voteupCount} 赞`);
-			} else {
-				// 第二级：问题回答列表翻页
-				let found = false;
-				for (let pageOffset = 0; pageOffset < 200 && !found; pageOffset += 20) {
-					try {
-						const listRes = await requestUrl({
-							url: `https://www.zhihu.com/api/v4/questions/${questionId}/answers?include=data%5B*%5D.voteup_count,data%5B*%5D.comment_count,data%5B*%5D.thanks_count,data%5B*%5D.id&limit=20&offset=${pageOffset}&sort_by=created_time`,
-							method: "GET",
-							headers: {
-								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-								Cookie: this.settings.cookie,
-							},
-						});
-						const listData = listRes.json;
-						const match = listData.data?.find((a: any) => String(a.id) === answerId);
-						if (match) {
-							voteupCount = match.voteup_count ?? 0;
-							commentCount = match.comment_count ?? 0;
-							found = true;
-							console.log(`[zhihu-loader] 单篇翻页命中: ${answerId} - ${voteupCount} 赞`);
-						}
-						if (listData.paging?.is_end) break;
-					} catch (e) {
-						console.warn(`[zhihu-loader] 问题列表翻页失败:`, e);
-						break;
-					}
-				}
-
-				// 第三级：link_card_infos 兜底
-				if (!found) {
-					try {
-						const cardUrl = encodeURIComponent(cleanUrl);
-						const cardRes = await requestUrl({
-							url: `https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls=${cardUrl}`,
-							method: "GET",
-							headers: {
-								"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-								Cookie: this.settings.cookie,
-							},
-						});
-						const cardText = cardRes.text;
-						if (cardText) {
-							const cardData = JSON.parse(cardText);
-							const firstUrl = Object.keys(cardData)[0];
-							const cardInfo = firstUrl ? cardData[firstUrl] : null;
-							if (cardInfo?.extra_info) {
-								const extraInfo = JSON.parse(cardInfo.extra_info);
-								const desc = (extraInfo.desc || "").replace(/<[^>]+>/g, "").trim();
-								const voteupMatch = desc.match(/(\d+)\s*赞同/);
-								const commentMatch = desc.match(/(\d+)\s*评论/);
-								if (voteupMatch) voteupCount = parseInt(voteupMatch[1]) || 0;
-								if (commentMatch) commentCount = parseInt(commentMatch[1]) || 0;
-								console.log(`[zhihu-loader] link_card_infos 兜底: ${desc}`);
-							}
-						}
-					} catch (e) {
-						console.warn(`[zhihu-loader] link_card_infos 获取失败:`, e);
-					}
-				}
-			}
+			const answerStats = await fetchAnswerStats(
+				answerId,
+				questionId || "",
+				cleanUrl,
+				this.settings.cookie,
+				cachedStats,
+			);
+			voteupCount = answerStats.voteupCount;
+			commentCount = answerStats.commentCount;
+			collectCount = answerStats.collectCount;
+			readCount = answerStats.readCount;
 
 			// 增量判断
 			const vault = this.app.vault;
@@ -1149,12 +831,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			if (!(await vault.adapter.exists(assetDir))) await vault.createFolder(assetDir);
 
 			// 文件名 sanitize（与批量同步规则保持一致）
-			// 文件名 sanitize（与批量同步规则保持一致）
-			const safeName = apiTitle
-				.replace(/[\\/:*?"<>|#\[\]]/g, "_")  // 替换非法字符为下划线（问号保留）
-				.replace(/_+/g, "_")                  // 合并连续下划线
-				.replace(/^_|_$/g, "")                 // 去除首尾下划线
-				.substring(0, 120);
+			const safeName = sanitizeTitle(apiTitle);
 			const path = `${answerDir}/${safeName}.md`;
 			const stats = await vault.adapter.stat(path);
 
@@ -1197,184 +874,5 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			if (url) await this.fetchZhihuAnswer(url);
 		});
 		modal.open();
-	}
-}
-
-class ZhihuSettingTab extends PluginSettingTab {
-	plugin: ZhihuLoaderPlugin;
-	constructor(app: App, plugin: ZhihuLoaderPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-		plugin.settingTab = this; // 保存引用用于刷新
-	}
-	display(): void {
-		const { containerEl } = this;
-		containerEl.empty();
-
-		// ========== 登录状态区域 ==========
-		const isLoggedIn = this.plugin.isZhihuLoggedIn();
-
-		if (isLoggedIn) {
-			// 已登录状态 - 卡片式布局
-			containerEl.createDiv({ text: "账号", cls: "setting-item-heading" });
-
-			const cardDiv = containerEl.createDiv("zhihu-login-card zhihu-card-loggedin");
-			cardDiv.style.cssText = "border-radius: 8px; padding: 16px; margin: 8px 0; background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border: 1px solid #86efac;";
-
-			// 头部：头像 + 用户名
-			const headerDiv = cardDiv.createDiv();
-			headerDiv.style.cssText = "display: flex; align-items: center; gap: 12px; margin-bottom: 12px;";
-
-			// 头像（增强兜底：SVG data URL 作为默认值，避免 onerror 闪烁）
-			const defaultAvatar = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24' fill='%2322c55e'%3E%3Cpath d='M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z'/%3E%3C/svg%3E";
-			const avatarImg = headerDiv.createEl("img");
-			avatarImg.style.cssText = "width: 48px; height: 48px; border-radius: 50%; border: 2px solid #22c55e; object-fit: cover; flex-shrink: 0;";
-			if (this.plugin.settings.userAvatar) {
-				avatarImg.src = this.plugin.settings.userAvatar;
-				avatarImg.alt = "头像";
-				// 图片加载失败时使用 SVG 兜底
-				avatarImg.onerror = () => {
-					avatarImg.src = defaultAvatar;
-				};
-			} else {
-				avatarImg.src = defaultAvatar;
-				avatarImg.alt = "默认头像";
-			}
-
-			// 用户名 + 状态
-			const userInfoDiv = headerDiv.createDiv();
-			userInfoDiv.style.cssText = "flex: 1; min-width: 0;";
-
-			const nameDiv = userInfoDiv.createDiv({
-				text: this.plugin.settings.userName || "知乎用户",
-			});
-			nameDiv.style.cssText = "font-weight: 600; font-size: 16px; color: #166534; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
-
-			const statusBadge = userInfoDiv.createDiv();
-			statusBadge.style.cssText = "display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; background: #22c55e; color: white; font-weight: 500;";
-			statusBadge.textContent = "✅ 已登录";
-
-			// 用户 ID（People ID）- 始终显示，已登录时可编辑
-			new Setting(containerEl)
-				.setName("我的知乎 People ID")
-				.setDesc("自动获取，扫码登录后填充。如未显示请手动填写")
-				.addText((t) =>
-					t
-						.setValue(this.plugin.settings.zhihuId || "")
-						.setPlaceholder("输入你的知乎 People ID")
-						.onChange(async (v) => {
-							this.plugin.settings.zhihuId = v;
-							await this.plugin.saveSettings();
-						}),
-				);
-
-			// 注销按钮（单独一行）
-			const logoutBtn = containerEl.createEl("button");
-			logoutBtn.style.cssText = "margin-top: 8px; padding: 6px 16px; border-radius: 6px; border: 1px solid #f87171; background: white; color: #dc2626; cursor: pointer; font-size: 13px; transition: all 0.2s;";
-			logoutBtn.textContent = "注销登录";
-			logoutBtn.onmouseover = () => { logoutBtn.style.background = "#fef2f2"; };
-			logoutBtn.onmouseout = () => { logoutBtn.style.background = "white"; };
-			logoutBtn.onclick = async () => {
-				await this.plugin.logoutZhihu();
-				this.display();
-			};
-		} else {
-			// 未登录状态 - 灰色卡片
-			containerEl.createDiv({ text: "账号", cls: "setting-item-heading" });
-
-			const cardDiv = containerEl.createDiv("zhihu-login-card zhihu-card-logout");
-			cardDiv.style.cssText = "border-radius: 8px; padding: 16px; margin: 8px 0; background: #f9fafb; border: 1px solid #e5e7eb;";
-
-			// 状态标签
-			const statusBadge = cardDiv.createDiv();
-			statusBadge.style.cssText = "display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; background: #9ca3af; color: white; font-weight: 500; margin-bottom: 12px;";
-			statusBadge.textContent = "⚪ 未登录";
-
-			// 说明文字
-			const hintDiv = cardDiv.createDiv({ text: "请使用下方「扫码登录」按钮登录知乎账号。登录后 Cookie 将自动保存，同步功能即可使用。" });
-			hintDiv.style.cssText = "font-size: 13px; color: #6b7280; margin-bottom: 16px; line-height: 1.5;";
-
-			// 扫码登录按钮
-			const loginBtn = cardDiv.createEl("button");
-			loginBtn.style.cssText = "width: 100%; padding: 10px 16px; border-radius: 6px; border: none; background: linear-gradient(135deg, #1f2937 0%, #374151 100%); color: white; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.2s;";
-			loginBtn.textContent = "🔐 打开知乎登录页";
-			loginBtn.onmouseover = () => { loginBtn.style.background = "linear-gradient(135deg, #374151 0%, #4b5563 100%)"; };
-			loginBtn.onmouseout = () => { loginBtn.style.background = "linear-gradient(135deg, #1f2937 0%, #374151 100%)"; };
-			loginBtn.onclick = () => {
-				this.plugin.openZhihuLogin();
-			};
-
-			// 备用：手动输入 Cookie
-			const divider = cardDiv.createDiv({ text: "— 备用方案 —" });
-			divider.style.cssText = "text-align: center; font-size: 12px; color: #9ca3af; margin: 16px 0 12px;";
-
-			const cookieInput = cardDiv.createEl("input");
-			cookieInput.type = "text";
-			cookieInput.placeholder = "粘贴 Cookie（以 z_c0= 开头）";
-			cookieInput.value = this.plugin.settings.cookie || "";
-			cookieInput.style.cssText = "width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #d1d5db; font-size: 13px; box-sizing: border-box; margin-bottom: 8px;";
-			cookieInput.onchange = async () => {
-				this.plugin.settings.cookie = cookieInput.value;
-				await this.plugin.saveSettings();
-				this.display();
-			};
-
-			const manualHint = cardDiv.createDiv({ text: "不推荐：手动输入 Cookie 易出错，仅在扫码登录不可用时使用" });
-			manualHint.style.cssText = "font-size: 11px; color: #9ca3af;";
-		}
-		new Setting(containerEl).setName("根目录名称").addText((t) =>
-			t
-				.setValue(this.plugin.settings.downloadFolder)
-				.onChange(async (v) => {
-					this.plugin.settings.downloadFolder = v;
-					await this.plugin.saveSettings();
-				}),
-		);
-		new Setting(containerEl)
-			.setName("同步时抓取创作者推荐")
-			.addToggle((t) =>
-				t
-					.setValue(this.plugin.settings.enableRecommendSync)
-					.onChange(async (v) => {
-						this.plugin.settings.enableRecommendSync = v;
-						await this.plugin.saveSettings();
-					}),
-			);
-		new Setting(containerEl)
-			.setName("同步时抓取好物推荐")
-			.setDesc("开启后将在 Goods 文件夹生成清单")
-			.addToggle((t) =>
-				t
-					.setValue(this.plugin.settings.enableGoodsSync)
-					.onChange(async (v) => {
-						this.plugin.settings.enableGoodsSync = v;
-						await this.plugin.saveSettings();
-					}),
-			);
-	}
-}
-
-class ImportModal extends Modal {
-	url: string = "";
-	onSubmit: (url: string) => void;
-	constructor(app: App, onSubmit: (url: string) => void) {
-		super(app);
-		this.onSubmit = onSubmit;
-	}
-	onOpen() {
-		const { contentEl } = this;
-		contentEl.createEl("h2", { text: "导入单个回答" });
-		new Setting(contentEl)
-			.setName("链接")
-			.addText((text) => text.onChange((v) => (this.url = v)));
-		new Setting(contentEl).addButton((b) =>
-			b
-				.setButtonText("开始")
-				.setCta()
-				.onClick(() => {
-					this.close();
-					this.onSubmit(this.url);
-				}),
-		);
 	}
 }
