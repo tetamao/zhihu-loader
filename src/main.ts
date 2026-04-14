@@ -9,6 +9,7 @@ import {
 	TFile,
 } from "obsidian";
 import TurndownService from "turndown";
+import { ZhihuLoginModal } from "./components/ZhihuLoginModal";
 
 interface ZhihuSettings {
 	downloadFolder: string;
@@ -16,6 +17,9 @@ interface ZhihuSettings {
 	zhihuId: string;
 	enableRecommendSync: boolean;
 	enableGoodsSync: boolean;
+	userName?: string;
+	userAvatar?: string;
+	cookieValidUntil?: number;
 }
 
 const DEFAULT_SETTINGS: ZhihuSettings = {
@@ -28,6 +32,7 @@ const DEFAULT_SETTINGS: ZhihuSettings = {
 
 export default class ZhihuLoaderPlugin extends Plugin {
 	settings: ZhihuSettings;
+	settingTab?: ZhihuSettingTab;
 	// creations 缓存：key=answerId, value=统计数据 + 元信息
 	creationsCache: Map<string, {
 		voteupCount: number;
@@ -79,7 +84,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 						readCount: item.reaction?.read_count ?? 0,
 						updatedTime: item.data?.updated_time ?? 0,
 						questionId: String(item.data?.question?.id ?? ""),
-						title: item.data?.question?.title ?? "",
+						// 兼容两种 API 数据结构：creations/v2/all 用 item.data.question.title，members/answers 用 item.question.title
+						title: item.data?.question?.title || item.question?.title || "",
 					});
 				}
 
@@ -106,6 +112,121 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 		console.log(`[zhihu-loader] creations 缓存构建完成，共 ${this.creationsCache.size} 条`);
 		new Notice(`📦 缓存构建完成 (${this.creationsCache.size} 条)`);
+	}
+
+	/**
+	 * 打开知乎扫码登录弹窗，登录成功后自动保存 Cookie 和用户信息
+	 */
+	openZhihuLogin() {
+		const modal = new ZhihuLoginModal(
+			this.app,
+			async (cookie: string, userName?: string, peopleId?: string, avatarUrl?: string) => {
+				// 保存 Cookie
+				this.settings.cookie = cookie;
+				this.settings.userName = userName || "";
+				if (avatarUrl) {
+					this.settings.userAvatar = avatarUrl;
+				}
+				// 粗略估计有效期（知乎 Cookie 通常约 30 天）
+				this.settings.cookieValidUntil = Date.now() + 30 * 24 * 60 * 60 * 1000;
+
+				// 如果扫码已获取 peopleId，直接使用（url_token，用户端展示格式）
+				if (peopleId) {
+					this.settings.zhihuId = peopleId;
+				}
+
+				// 如果没有获取到 peopleId，尝试从 API 获取
+				if (!peopleId) {
+					try {
+						const meRes = await requestUrl({
+							url: "https://www.zhihu.com/api/v4/me",
+							method: "GET",
+							headers: {
+								"User-Agent": "Mozilla/5.0",
+								Cookie: cookie,
+							},
+						});
+						const meData = meRes.json;
+						if (meData?.url_token) {
+							// 优先使用 url_token（用户端展示格式）
+							this.settings.zhihuId = meData.url_token;
+						} else if (meData?.id) {
+							// 兜底使用数字 ID
+							this.settings.zhihuId = String(meData.id);
+						}
+						// 保存用户名和头像（优先用 API 返回的，质量更高）
+						if (meData?.name && !this.settings.userName) {
+							this.settings.userName = meData.name;
+						}
+						if (meData?.avatar_url) {
+							this.settings.userAvatar = meData.avatar_url;
+						}
+					} catch (_e) {
+						// 获取 ID 失败不影响登录成功
+					}
+				}
+
+				await this.saveSettings();
+				new Notice(`✅ 知乎登录成功！${userName ? `欢迎，${userName}` : ""}`);
+
+				// 刷新设置页
+				this.settingTab?.display();
+			},
+			() => {
+				// 取消登录
+				new Notice("ℹ️ 登录已取消");
+			},
+		);
+		modal.open();
+	}
+
+	/**
+	 * 注销知乎登录，清除 Cookie 和用户信息
+	 */
+	async logoutZhihu() {
+		this.settings.cookie = "";
+		this.settings.userName = "";
+		this.settings.userAvatar = "";
+		this.settings.cookieValidUntil = undefined;
+		this.settings.zhihuId = "";
+		// 清理 creations 缓存
+		this.creationsCache.clear();
+		// 清理 Electron session 中的 zhihu cookie，避免残留登录状态
+		this.clearElectronZhihuCookies();
+		await this.saveSettings();
+		new Notice("✅ 已注销知乎登录");
+	}
+
+	/**
+	 * 清除 Electron defaultSession 中 zhihu 相关的 Cookie
+	 * 这样重新打开登录窗口时不会残留旧登录状态
+	 */
+	private async clearElectronZhihuCookies() {
+		try {
+			const { remote } = require("electron");
+			const session = remote.session;
+			const domains = ["zhihu.com", ".zhihu.com", "www.zhihu.com", "link.zhihu.com"];
+			for (const domain of domains) {
+				try {
+					const cookies = await session.cookies.get({ domain });
+					for (const cookie of cookies) {
+						await session.cookies.remove(`https://${cookie.domain || domain}`, cookie.name);
+					}
+				} catch (_e) {
+					// ignore
+				}
+			}
+			console.log("[zhihu-loader] 已清除 Electron session 中的 zhihu cookie");
+		} catch (_e) {
+			// Electron 不可用时忽略
+		}
+	}
+
+	/**
+	 * 判断当前是否已登录（Cookie 非空）
+	 */
+	isZhihuLoggedIn(): boolean {
+		return !!(this.settings.cookie && this.settings.cookie.includes("z_c0"));
 	}
 
 	/**
@@ -270,7 +391,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			await this.buildCreationsCache();
 
 			// ===== 第一步：从问答列表翻页获取所有回答ID =====
-			const answerList: Array<{ id: string; questionId: string; updatedTime: number }> = [];
+			const answerList: Array<{ id: string; questionId: string; updatedTime: number; title: string }> = [];
 			let offset = 0;
 			const PAGE_SIZE = 20;
 
@@ -278,8 +399,8 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 			while (true) {
 				try {
-					const res = await requestUrl({
-						url: `https://www.zhihu.com/api/v4/members/${userId}/answers?offset=${offset}&limit=${PAGE_SIZE}&sort_by=updated&include=question,created_time,updated_time`,
+				const res = await requestUrl({
+					url: `https://www.zhihu.com/api/v4/members/${userId}/answers?offset=${offset}&limit=${PAGE_SIZE}&sort_by=updated&include=question.title,created_time,updated_time`,
 						method: "GET",
 						headers: {
 							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -291,15 +412,19 @@ export default class ZhihuLoaderPlugin extends Plugin {
 
 					if (items.length === 0) break;
 
-					for (const item of items) {
-						if (item.id && item.question?.id) {
-							answerList.push({
-								id: String(item.id),
-								questionId: String(item.question.id),
-								updatedTime: item.updated_time || 0,
-							});
-						}
+				for (const item of items) {
+					if (item.id && item.question?.id) {
+						// 优先从 creationsCache 获取 title，fallback 到列表数据
+						const cached = this.creationsCache.get(String(item.id));
+						const title = cached?.title || item.question?.title || `未命名_${item.id}`;
+						answerList.push({
+							id: String(item.id),
+							questionId: String(item.question.id),
+							updatedTime: item.updated_time || 0,
+							title,
+						});
 					}
+				}
 
 					console.log(`[zhihu-loader] 已获取 ${answerList.length} 条回答列表...`);
 
@@ -335,17 +460,27 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const answerId = answer.id;
 			const questionId = answer.questionId;
 			const answerUrl = `https://www.zhihu.com/question/${questionId}/answer/${answerId}`;
+			// 优先用 creationsCache 的 title，fallback 到 answerList 阶段获取的 title
+			const cachedEntry = this.creationsCache.get(answerId);
+			const apiTitle = cachedEntry?.title || answer.title;
 
-			// ===== 增量判断（请求前，基于 answerId 命名的本地文件）=====
-			const localPath = `${answerDir}/${answerId}.md`;
+			// ===== 文件名用回答标题（sanitize 处理特殊字符）=====
+			// 规则：问号全部保留，只替换文件系统非法字符和 Obsidian 特殊字符
+			const safeTitle = apiTitle
+				.replace(/[\\/:*?"<>|#\[\]]/g, "_")  // 替换非法字符为下划线（问号保留）
+				.replace(/_+/g, "_")                  // 合并连续下划线
+				.replace(/^_|_$/g, "")                 // 去除首尾下划线
+				.substring(0, 120);                    // 截断
+
+			// ===== 增量判断（请求前，基于标题命名的本地文件）=====
+			const localPath = `${answerDir}/${safeTitle}.md`;
 			const localStats = await vault.adapter.stat(localPath);
 			// 用 creations 缓存中的 updatedTime，fallback 到列表中的 updatedTime
-			const cachedEntry = this.creationsCache.get(answerId);
 			const remoteUpdatedTime = cachedEntry?.updatedTime ?? answer.updatedTime ?? 0;
 
 			if (localStats && remoteUpdatedTime && localStats.mtime >= remoteUpdatedTime * 1000) {
 				totalSkipped++;
-				console.log(`[zhihu-loader] 跳过（本地已是最新）: ${answerId}`);
+				console.log(`[zhihu-loader] 跳过（本地已是最新）: ${safeTitle}`);
 				continue;  // ← 完全不发任何 API 请求
 			}
 
@@ -361,9 +496,10 @@ export default class ZhihuLoaderPlugin extends Plugin {
 				collectCount = cachedEntry.collectCount;
 				readCount = cachedEntry.readCount;
 				cacheHit++;
-				console.log(`[zhihu-loader] 缓存命中: ${answerId} - ${voteupCount} 赞`);
+				console.log(`[zhihu-loader] 缓存命中: ${safeTitle} - ${voteupCount} 赞`);
 			} else {
 				cacheMiss++;
+				console.log(`[zhihu-loader] 缓存未命中，将请求 API: ${safeTitle}`);
 			}
 
 			// ===== 发起网络请求：并行获取基本信息 + 正文 =====
@@ -403,8 +539,9 @@ export default class ZhihuLoaderPlugin extends Plugin {
 					try { contentData = JSON.parse(contentText); } catch { throw new Error(`contentRes 非JSON: ${contentText.substring(0, 100)}`); }
 					if (info.error) throw new Error(`回答已删除: ${info.error.message}`);
 
-					const answerContent = contentData.content || "";
-					const apiTitle = info.question?.title || "无标题";
+				const answerContent = contentData.content || "";
+				// 优先使用已缓存的标题，API 返回的 title 作为兜底
+				const finalTitle = apiTitle || info.question?.title || "无标题";
 
 					// 缓存未命中时：用问题回答列表翻页获取统计数据
 					if (!cachedEntry) {
@@ -467,12 +604,12 @@ export default class ZhihuLoaderPlugin extends Plugin {
 						}
 					}
 
-					// 处理正文和图片（文件名使用 answerId）
-					const result = await this.processAndSaveAnswer({
-						answerId,
-						questionId,
-						answerUrl,
-						apiTitle,
+				// 处理正文和图片（文件名使用回答标题）
+				const result = await this.processAndSaveAnswer({
+					answerId,
+					questionId,
+					answerUrl,
+					apiTitle: finalTitle,
 						answerContent,
 						voteupCount,
 						commentCount,
@@ -1011,7 +1148,13 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			if (!(await vault.adapter.exists(answerDir))) await vault.createFolder(answerDir);
 			if (!(await vault.adapter.exists(assetDir))) await vault.createFolder(assetDir);
 
-			const safeName = apiTitle.replace(/[\\/:*?"<>|]/g, "-");
+			// 文件名 sanitize（与批量同步规则保持一致）
+			// 文件名 sanitize（与批量同步规则保持一致）
+			const safeName = apiTitle
+				.replace(/[\\/:*?"<>|#\[\]]/g, "_")  // 替换非法字符为下划线（问号保留）
+				.replace(/_+/g, "_")                  // 合并连续下划线
+				.replace(/^_|_$/g, "")                 // 去除首尾下划线
+				.substring(0, 120);
 			const path = `${answerDir}/${safeName}.md`;
 			const stats = await vault.adapter.stat(path);
 
@@ -1062,28 +1205,123 @@ class ZhihuSettingTab extends PluginSettingTab {
 	constructor(app: App, plugin: ZhihuLoaderPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+		plugin.settingTab = this; // 保存引用用于刷新
 	}
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		new Setting(containerEl)
-			.setName("知乎 Cookie")
-			.setDesc("用于获取推荐内容，Cookie 信息将隐藏显示")
-			.addText((t) =>
-				t
-					.setPlaceholder("输入你的知乎 Cookie")
-					.setValue(this.plugin.settings.cookie)
-					.onChange(async (v) => {
-						this.plugin.settings.cookie = v;
-						await this.plugin.saveSettings();
-					}),
-			);
-		new Setting(containerEl).setName("我的 ID (People ID)").addText((t) =>
-			t.setValue(this.plugin.settings.zhihuId).onChange(async (v) => {
-				this.plugin.settings.zhihuId = v;
+
+		// ========== 登录状态区域 ==========
+		const isLoggedIn = this.plugin.isZhihuLoggedIn();
+
+		if (isLoggedIn) {
+			// 已登录状态 - 卡片式布局
+			containerEl.createDiv({ text: "账号", cls: "setting-item-heading" });
+
+			const cardDiv = containerEl.createDiv("zhihu-login-card zhihu-card-loggedin");
+			cardDiv.style.cssText = "border-radius: 8px; padding: 16px; margin: 8px 0; background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border: 1px solid #86efac;";
+
+			// 头部：头像 + 用户名
+			const headerDiv = cardDiv.createDiv();
+			headerDiv.style.cssText = "display: flex; align-items: center; gap: 12px; margin-bottom: 12px;";
+
+			// 头像（增强兜底：SVG data URL 作为默认值，避免 onerror 闪烁）
+			const defaultAvatar = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='48' height='48' viewBox='0 0 24 24' fill='%2322c55e'%3E%3Cpath d='M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z'/%3E%3C/svg%3E";
+			const avatarImg = headerDiv.createEl("img");
+			avatarImg.style.cssText = "width: 48px; height: 48px; border-radius: 50%; border: 2px solid #22c55e; object-fit: cover; flex-shrink: 0;";
+			if (this.plugin.settings.userAvatar) {
+				avatarImg.src = this.plugin.settings.userAvatar;
+				avatarImg.alt = "头像";
+				// 图片加载失败时使用 SVG 兜底
+				avatarImg.onerror = () => {
+					avatarImg.src = defaultAvatar;
+				};
+			} else {
+				avatarImg.src = defaultAvatar;
+				avatarImg.alt = "默认头像";
+			}
+
+			// 用户名 + 状态
+			const userInfoDiv = headerDiv.createDiv();
+			userInfoDiv.style.cssText = "flex: 1; min-width: 0;";
+
+			const nameDiv = userInfoDiv.createDiv({
+				text: this.plugin.settings.userName || "知乎用户",
+			});
+			nameDiv.style.cssText = "font-weight: 600; font-size: 16px; color: #166534; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+
+			const statusBadge = userInfoDiv.createDiv();
+			statusBadge.style.cssText = "display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; background: #22c55e; color: white; font-weight: 500;";
+			statusBadge.textContent = "✅ 已登录";
+
+			// 用户 ID（People ID）- 始终显示，已登录时可编辑
+			new Setting(containerEl)
+				.setName("我的知乎 People ID")
+				.setDesc("自动获取，扫码登录后填充。如未显示请手动填写")
+				.addText((t) =>
+					t
+						.setValue(this.plugin.settings.zhihuId || "")
+						.setPlaceholder("输入你的知乎 People ID")
+						.onChange(async (v) => {
+							this.plugin.settings.zhihuId = v;
+							await this.plugin.saveSettings();
+						}),
+				);
+
+			// 注销按钮（单独一行）
+			const logoutBtn = containerEl.createEl("button");
+			logoutBtn.style.cssText = "margin-top: 8px; padding: 6px 16px; border-radius: 6px; border: 1px solid #f87171; background: white; color: #dc2626; cursor: pointer; font-size: 13px; transition: all 0.2s;";
+			logoutBtn.textContent = "注销登录";
+			logoutBtn.onmouseover = () => { logoutBtn.style.background = "#fef2f2"; };
+			logoutBtn.onmouseout = () => { logoutBtn.style.background = "white"; };
+			logoutBtn.onclick = async () => {
+				await this.plugin.logoutZhihu();
+				this.display();
+			};
+		} else {
+			// 未登录状态 - 灰色卡片
+			containerEl.createDiv({ text: "账号", cls: "setting-item-heading" });
+
+			const cardDiv = containerEl.createDiv("zhihu-login-card zhihu-card-logout");
+			cardDiv.style.cssText = "border-radius: 8px; padding: 16px; margin: 8px 0; background: #f9fafb; border: 1px solid #e5e7eb;";
+
+			// 状态标签
+			const statusBadge = cardDiv.createDiv();
+			statusBadge.style.cssText = "display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 12px; background: #9ca3af; color: white; font-weight: 500; margin-bottom: 12px;";
+			statusBadge.textContent = "⚪ 未登录";
+
+			// 说明文字
+			const hintDiv = cardDiv.createDiv({ text: "请使用下方「扫码登录」按钮登录知乎账号。登录后 Cookie 将自动保存，同步功能即可使用。" });
+			hintDiv.style.cssText = "font-size: 13px; color: #6b7280; margin-bottom: 16px; line-height: 1.5;";
+
+			// 扫码登录按钮
+			const loginBtn = cardDiv.createEl("button");
+			loginBtn.style.cssText = "width: 100%; padding: 10px 16px; border-radius: 6px; border: none; background: linear-gradient(135deg, #1f2937 0%, #374151 100%); color: white; cursor: pointer; font-size: 14px; font-weight: 500; transition: all 0.2s;";
+			loginBtn.textContent = "🔐 打开知乎登录页";
+			loginBtn.onmouseover = () => { loginBtn.style.background = "linear-gradient(135deg, #374151 0%, #4b5563 100%)"; };
+			loginBtn.onmouseout = () => { loginBtn.style.background = "linear-gradient(135deg, #1f2937 0%, #374151 100%)"; };
+			loginBtn.onclick = () => {
+				this.plugin.openZhihuLogin();
+			};
+
+			// 备用：手动输入 Cookie
+			const divider = cardDiv.createDiv({ text: "— 备用方案 —" });
+			divider.style.cssText = "text-align: center; font-size: 12px; color: #9ca3af; margin: 16px 0 12px;";
+
+			const cookieInput = cardDiv.createEl("input");
+			cookieInput.type = "text";
+			cookieInput.placeholder = "粘贴 Cookie（以 z_c0= 开头）";
+			cookieInput.value = this.plugin.settings.cookie || "";
+			cookieInput.style.cssText = "width: 100%; padding: 8px 12px; border-radius: 6px; border: 1px solid #d1d5db; font-size: 13px; box-sizing: border-box; margin-bottom: 8px;";
+			cookieInput.onchange = async () => {
+				this.plugin.settings.cookie = cookieInput.value;
 				await this.plugin.saveSettings();
-			}),
-		);
+				this.display();
+			};
+
+			const manualHint = cardDiv.createDiv({ text: "不推荐：手动输入 Cookie 易出错，仅在扫码登录不可用时使用" });
+			manualHint.style.cssText = "font-size: 11px; color: #9ca3af;";
+		}
 		new Setting(containerEl).setName("根目录名称").addText((t) =>
 			t
 				.setValue(this.plugin.settings.downloadFolder)
