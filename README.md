@@ -1,8 +1,8 @@
 # Obsidian Zhihu Loader
 
-[![GitHub license](https://badgen.net/github/license/NUeZRAzh/obsidian-zhihu-loader)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/blob/main/LICENSE)
-[![GitHub latest release](https://badgen.net/github/release/NUeZRAzh/obsidian-zhihu-loader/latest/)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases)
-[![GitHub all releases](https://img.shields.io/github/downloads/NUeZRAzh/obsidian-zhihu-loader/total.svg)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases)
+[![GitHub license](https://badgen.net/github/license/tetamao/zhihu-loader)](https://github.com/tetamao/zhihu-loader/blob/main/LICENSE)
+[![GitHub latest release](https://badgen.net/github/release/tetamao/zhihu-loader/latest/)](https://github.com/tetamao/zhihu-loader/releases)
+[![GitHub all releases](https://img.shields.io/github/downloads/tetamao/zhihu-loader/total.svg)](https://github.com/tetamao/zhihu-loader/releases)
 
 Obsidian 知乎同步插件 — 将知乎回答转化为结构化的本地 Markdown 笔记，实现知识的永久存档。支持扫码登录、增量同步、深度元数据抓取、图片本地化。
 
@@ -25,7 +25,7 @@ Obsidian 知乎同步插件 — 将知乎回答转化为结构化的本地 Markd
 
 ### 手动安装
 
-1. 到 [Releases](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases) 下载最新版本 `main.js`、`manifest.json`
+1. 到 [Releases](https://github.com/tetamao/zhihu-loader/releases) 下载最新版本 `main.js`、`manifest.json`
 2. 放入 Obsidian 插件目录 `.obsidian/plugins/zhihu-loader/`
 3. 在 Obsidian 设置中启用插件
 
@@ -98,7 +98,7 @@ answerId: "xxx"
 
 ## 更新历史
 
-https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases
+https://github.com/tetamao/zhihu-loader/releases
 
 ---
 
