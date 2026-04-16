@@ -1,156 +1,125 @@
-# Obsidian Zhihu Sync Master 🚀
+# Obsidian Zhihu Loader
 
-这是一个专为知乎创作者和深度读者打造的 Obsidian 内容备份工具。它可以将你的知乎回答快速转化为结构化的本地 Markdown 笔记，实现知识的永久存档。
+[![GitHub license](https://badgen.net/github/license/NUeZRAzh/obsidian-zhihu-loader)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/blob/main/LICENSE)
+[![GitHub latest release](https://badgen.net/github/release/NUeZRAzh/obsidian-zhihu-loader/latest/)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases)
+[![GitHub all releases](https://img.shields.io/github/downloads/NUeZRAzh/obsidian-zhihu-loader/total.svg)](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases)
 
-## ✨ 核心特性
-
-- **⚡ 一键全量同步**：只需填入 People ID，点击侧边栏图标，即可自动抓取你发布的最新回答（默认前 20 条），无需繁琐的复制粘贴。
-- **📊 深度元数据抓取**：自动生成 YAML 属性（Properties），包含标题、URL、作者、话题、点赞数、评论数、收藏数、回答日期及更新日期。
-- **🖼️ 智能图片本地化**：自动抓取回答中的图片并保存至本地 `attachments` 文件夹。
-- **♻️ 物理去重逻辑**：通过图片 ID 识别，确保同一张图在附件文件夹中仅存储一份，避免冗余占用空间。
-- **📝 完美的 Markdown 转换**：针对知乎 HTML 结构深度优化，保留排版细节，支持 Obsidian 原生图片语法 `![[...]]`。
-- **自动化目录结构**：插件会自动维护以下目录：
-    - `answers/`: 存放抓取的回答 MD 文件。
-    - `attachments/`: 存放本地化的图片资源。
-    - `recommend/`: 存放每日抓取的推荐问题日报。
-- **📥 全量同步**：一键同步个人所有回答，支持图片本地化，解决防盗链困扰。
-- **⚡ 增量更新（零请求跳过）**：以 `answerId` 为文件名，同步前先在本地比对修改时间，已同步且未更新的回答**完全不发出网络请求**，大幅降低 Cookie 被风控风险。
-- **🎯 灵活联动**：支持在同步回答时自动触发"创作者推荐"或"好物推荐"抓取。
-
-- **📦 2.0 创作增强**：
-    - **好物推荐抓取**：对接知乎 MCN 级接口，自动抓取高价值问题，生成含浏览量、回答数的 MD 表格。
-    - **定向存储**：自动维护 `Goods/` 文件夹，按日期生成好物日报。
+Obsidian 知乎同步插件 — 将知乎回答转化为结构化的本地 Markdown 笔记，实现知识的永久存档。支持扫码登录、增量同步、深度元数据抓取、图片本地化。
 
 ---
 
-## 🚀 安装与配置
+## 功能
 
-1. **安装**：将编译后的 `main.js`、`manifest.json` 放入 Obsidian 插件目录。
-2. **扫码登录**：在插件设置页点击「打开知乎登录页」，使用知乎 App 扫码授权。Cookie 将自动保存，People ID 自动获取。
-3. **手动 Cookie**（备用）：如扫码登录不可用，可手动粘贴 Cookie。
-4. **自定义路径**：可自定义根目录名称（默认为 `Zhihu_Imports`）。
-
-## 🚀 使用指南
-
-- **扫码登录**：打开设置页 → 点击「打开知乎登录页」→ 用知乎 App 扫码 → 自动保存 Cookie
-- **同步我的回答**：点击侧边栏的 **循环图标**，插件自动同步所有已发布回答（增量跳过未更新条目，零请求）。
-- **手动导入 (单篇模式)**：点击侧边栏的 **链接图标**，粘贴特定的回答链接进行针对性抓取。
-- **获取推荐**：打开设置页 → 点击「获取今日创作者中心推荐」
+- **全量/增量同步**：一键备份知乎回答，已同步且未更新的回答零请求，大幅降低 Cookie 被风控风险
+- **扫码登录**：Electron BrowserWindow 扫码授权，无需手动复制粘贴 Cookie
+- **深度元数据**：点赞数、评论数、收藏数、阅读数、话题标签、更新时间
+- **点赞数实时同步**：本地 frontmatter 与知乎数据实时比对，点赞数变化时自动更新本地文件
+- **图片本地化**：自动下载图片至 attachments 文件夹，解决防盗链困扰
+- **文件名标题化**：同步文件名为 `{问题标题}.md`，更直观易读
+- **好物推荐抓取**：MCN 级接口自动抓取高价值问题，生成含浏览量、回答数的 MD 表格
+- **联动同步**：支持在同步回答时自动触发推荐/好物抓取
 
 ---
 
-## 📅 版本记录 (Changelog)
+## 安装
 
-### v2.0.9 (2026-04-14) —— **扫码登录 Session 隔离修复 + 文件名改为标题** 🔐📝
+### 手动安装
 
-- **[Session 隔离修复 P0]** 深度修复扫码登录窗口不关闭问题：Electron 主进程与 BrowserWindow 的 Session Cookie Store 隔离导致 `session.cookies.get()` 读不到 httpOnly 的 `z_c0`；改用页面 DOM + 标题判断登录态（不依赖 z_c0），登录确认后再从 Electron Session 获取 z_c0，成功后才关闭窗口。
-- **[多路获取用户名/peopleId]** 登录成功后从页面 URL（`/people/xxx`）、DOM 元素、localStorage JSON、script 标签等多路获取用户名和 peopleId，准确性大幅提升。
-- **[文件名改为问题标题]** 同步文件名由 `answerId.md` 改为 `{问题标题}.md`，更直观易读；增量比对改为本地扫描现有文件读取 frontmatter 中的 answerId，零请求跳过能力保持不变。
-- **[文件名 sanitize 规则优化]** 统一 sanitize 逻辑：所有问号（半角/全角、任意位置）原样保留，其他非法字符（`\ / : * " < > | # [ ]`）替换为下划线；连续下划线合并，首尾下划线去除；标题超长截断至 120 字符。
-- **[诊断日志清理]** 移除 buildCreationsCache、列表 API、文件名诊断等 3 处残留 console.log，生产代码更干净。
+1. 到 [Releases](https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases) 下载最新版本 `main.js`、`manifest.json`
+2. 放入 Obsidian 插件目录 `.obsidian/plugins/zhihu-loader/`
+3. 在 Obsidian 设置中启用插件
 
-### v2.0.8 (2026-04-13) —— **增量比对提前，零请求跳过** 🛡️
-
-- **[架构优化]** 文件名由"问题标题"改为 `answerId.md`，使增量比对可在发出 API 请求前完成。
-- **[零请求跳过]** 已同步且未更新的回答直接跳过，**完全不向知乎发送任何请求**，大幅降低 Cookie 被风控风险。
-- **[creations 缓存扩展]** 缓存字段新增 `updatedTime`、`questionId`、`title`（来自 `creations/v2/all` 的 `data` 对象），供本地比对直接使用。
-- **[风控防护]** 所有 API 响应增加非 JSON 检测，遇到验证码/风控页面时即时弹出 Notice 并终止，不再静默卡死。
-- **[三级降级策略]** 统计数据获取顺序：creations 缓存（O(1)）→ 问题回答列表翻页 → link_card_infos 兜底。
-
-### v2.0.7 (2026-04-10) —— **风控防护 + 三级降级策略恢复** 🛡️
-
-- **[风控防护]** 所有 API 响应增加非 JSON 检测，遇验证码页面时弹 Notice 提示，不再静默卡死。
-- **[策略恢复]** 恢复完整三级降级：creations 缓存（O(1)）→ 问题列表翻页 → link_card_infos 兜底。
-- **[字段扩展]** processAndSaveAnswer 新增 `collectCount`、`readCount` 参数，frontmatter 同步写入收藏数和阅读数。
-- **[类型修复]** 修复 `src.split("?")[0]` 可能为 undefined 的 TypeScript 类型错误。
-
-### v2.0.6 (2026-04-10) —— **creations 全量缓存预拉取 + 缓存未命中零翻页** ⚡
-
-- **[性能优化]** 批量同步开始时，一次性拉取所有 `creations/v2/all` 数据建立 `answerId → reaction` 缓存 Map。
-- **[彻底消除翻页]** 缓存命中 → O(1) 直接取值；缓存未命中 → 直接读第一阶段 `/api/v4/answers/{id}` 已返回的 `voteup_count/comment_count/thanks_count`，**0 额外请求，0 翻页**。
-- **[四字段限制]** `collect_count`（收藏数）和 `read_count`（阅读数）只有 `creations/v2/all` 能返回，这是知乎 API 限制，极老/下架回答这两个字段会为 0。
-- **[双模式]** 单篇导入时保持原有 creations 翻页逻辑；最终兜底仍为 `link_card_infos`。
-
-### v2.0.5 (2026-04-09) —— **creations/v2/all 参数修复** 🛠️
-
-- **[关键修复]** 修复 `creations/v2/all` API 的请求参数，修正时间范围和排序方式。
-- **[参数对照]** 通过浏览器开发者工具分析，成功请求参数为 `start=0&end=0&limit=10&offset=10&need_co_creation=0&sort_type=updated`。
-- **[功能完善]** 成功获取收藏数和阅读数，实现全部统计数据完整获取。
-- **[降级保留]** 保留 `link_card_infos` 作为备用方案，确保稳定性。
-
-### v2.0.4 (2026-04-09) —— **统计数据 API 重构** 🛠️
-
-- **[API 重构]** 知乎 `/api/v4/answers/{id}` 不再返回 `voteup_count`、`comment_count` 等统计字段，改用 `/api/v4/editor/link_card_infos` API 获取统计数据。
-- **[数据解析]** 从 `extra_info.desc` 字段解析统计数据（格式如 "222 赞同 · 81 评论"），使用正则表达式提取点赞数和评论数。
-- **[字段更新]** frontmatter 字段调整：`感谢数` → `收藏数`，新增 `阅读数` 字段。
-- **[数据完整]** 现在可以获取点赞数、评论数、收藏数、阅读数全部四项统计数据。
-
-### v2.0.3 (2026-04-09) —— **元数据修复版** 🛠️
-
-- **[关键修复]** 点赞数/评论数/感谢数获取由直接单接口改为**两阶段策略**：基本信息走 answer API，统计数据走问题列表 API，彻底解决限流导致统计数据为 0 的问题。
-- **[功能补全]** frontmatter 新增字段：`评论数`、`感谢数`、`作者`、`更新日期`。
-- **[体验优化]** 修复 SVG 占位图导致的 Obsidian `![[data:image/svg+xml...]]` 报错。
-- **[稳定性]** 数据字段统一加 `?? 0` 兜底，防止 undefined 写入文档。
-
-### v2.0.2 (2026-04-08) —— **好物推荐增强版** 🌟
-
-- **[重大升级]** 好物推荐对接新版知乎 API 端点 `/creators/question_route/author_related/goods`。
-- **[功能增强]** 新增字段：`answer_count`（回答数）、`visit_count`（浏览量）、`follower_count`（关注数）、`created`（问题创建时间）。
-- **[链接修复]** 直接使用 API 返回的 `question.url`，无需手动拼接问题链接。
-- **[UI 优化]** MD 表格新增 2 列，展示更丰富的问题信息。
-
-### v2.0.1 (2026-04-02) —— **2.0 终极整合版** 🌟
-
-- **[重大修复]** 攻克好物推荐 404 报错，成功对接知乎最新 `mcn/recommend/question` 接口。
-- **[功能升级]** 强化文件夹递归创建逻辑，确保 `Goods` 与 `recommand` 目录在任何环境下均能稳定生成。
-- **[体验优化]** 模拟真实浏览器环境（Referer/UA），大幅提升抓取成功率。
-
-### v1.1.0 (2026-03-31) —— **联动进化**
-
-- **[新增]** "联动同步"逻辑，同步回答后自动触发推荐抓取。
-- **[优化]** 命令面板集成，支持独立运行推荐抓取命令。
-
-### v1.0.0 (2026-02) —— **核心诞生**
-
-- **[核心]** 实现增量同步与图片本地化存储。
+> 要求：Obsidian 0.15.0 及以上版本
 
 ---
 
-## 🛠️ 本地开发
+## 配置
 
-```bash
-# 安装依赖
-npm install
+1. 点击左侧边栏的 **知乎图标**，进入插件设置页面
+2. 点击「打开知乎登录页」，使用知乎 App 扫码授权，Cookie 和 People ID 将自动保存
+3. 如扫码登录不可用，可在设置页手动粘贴 Cookie（备用方案）
+4. 自定义根目录名称（默认为 `Zhihu_Imports`）
 
-# 开发模式（实时编译）
-npm run dev
+---
+
+## 使用
+
+### 同步我的回答
+
+点击侧边栏的 **循环图标**，插件自动同步所有已发布回答。
+
+同步逻辑：
+- 优先基于 `updated_time` 跳过内容未更新的条目（零 API 请求）
+- 同时比对本地 frontmatter 与知乎数据的统计字段，点赞数等变化时自动更新文件
+
+### 单篇导入
+
+点击侧边栏的 **链接图标**，粘贴特定的知乎回答链接，进行针对性抓取。
+
+### 获取推荐问题
+
+在设置页点击「获取今日创作者中心推荐」或「获取好物推荐」，自动生成日报文件。
+
+---
+
+## 文件结构
+
+插件会自动维护以下目录：
+
+```
+Zhihu_Imports/
+├── answers/       # 同步的回答 MD 文件
+├── attachments/   # 本地化的图片资源
+├── recommend/     # 创作者推荐日报
+└── Goods/         # 好物推荐日报
 ```
 
----
-
-## 📂 数据结构
-
-插件会为每一篇回答生成规范的 Properties 区域：
+每篇回答生成规范的 Properties 区域：
 
 ```yaml
 ---
-标题: "你的回答标题"
+标题: "问题标题"
 url: https://www.zhihu.com/...
+answerId: "xxx"
 话题: ['[[职场]]', '[[成长]]']
 点赞数: 1024
 评论数: 56
 收藏数: 23
 阅读数: 10086
-作者: 你的名字
+作者: 用户名
 日期: 2024-01-01
 更新: 2024-03-20
 ---
 ```
 
-> **注意**：`收藏数` 和 `阅读数` 来自 `creations/v2/all` 接口，极老或已下架回答可能为 0（知乎 API 限制）。
+> 注意：`收藏数` 和 `阅读数` 来自知乎 `creations/v2/all` 接口，极老或已下架回答可能为 0。
 
 ---
 
-## 🛡️ 免责声明
+## 更新历史
+
+https://github.com/NUeZRAzh/obsidian-zhihu-loader/releases
+
+---
+
+## 已知问题
+
+- Cookie 长期不使用可能会触发风控，需要在设置页重新扫码登录
+- `收藏数` 和 `阅读数` 依赖知乎 `creations/v2/all` 接口，极老/已下架回答可能为 0（知乎 API 限制）
+- 偶尔网络波动导致同步失败，重新点击同步即可，已同步文件不会重复写入
+
+---
+
+## TODO
+
+- [ ] 支持回答内容的变更检测与自动更新
+- [ ] 同步进度可视化（显示当前进度/总数）
+- [ ] 设置页面增加模板自定义功能
+- [ ] 支持回答草稿的导出
+- [ ] 导出热门评论
+
+---
+
+## 免责声明
 
 本工具仅用于个人知识管理与备份。请尊重原平台版权及社区规范，切勿用于商业用途或非法爬取。

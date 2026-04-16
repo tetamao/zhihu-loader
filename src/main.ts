@@ -20,6 +20,22 @@ import { DEFAULT_SETTINGS } from "./types";
 import { fetchAnswerStats } from "./stats";
 import { sanitizeTitle } from "./sanitize";
 
+/**
+ * 解析 Markdown 文件的 frontmatter 统计数据
+ */
+function parseFrontmatterStats(content: string): { voteupCount: number; commentCount: number; collectCount: number; readCount: number } {
+	const match = content.match(/^---\n([\s\S]*?)\n---/);
+	if (!match?.[1]) return { voteupCount: 0, commentCount: 0, collectCount: 0, readCount: 0 };
+
+	const fm = match[1];
+	return {
+		voteupCount: parseInt(fm.match(/点赞数:\s*(\d+)/)?.[1] ?? "0"),
+		commentCount: parseInt(fm.match(/评论数:\s*(\d+)/)?.[1] ?? "0"),
+		collectCount: parseInt(fm.match(/收藏数:\s*(\d+)/)?.[1] ?? "0"),
+		readCount: parseInt(fm.match(/阅读数:\s*(\d+)/)?.[1] ?? "0"),
+	};
+}
+
 export default class ZhihuLoaderPlugin extends Plugin {
 	settings: ZhihuSettings;
 	settingTab?: ZhihuSettingTab;
@@ -721,8 +737,26 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			].join("\n");
 
 			const file = vault.getAbstractFileByPath(path);
-			if (file instanceof TFile) await vault.modify(file, content);
-			else await vault.create(path, content);
+			// 文件已存在时，读取本地 frontmatter 比对统计数据
+			if (file instanceof TFile) {
+				const existingContent = await vault.read(file);
+				const localStats = parseFrontmatterStats(existingContent);
+
+				const hasStatsChanged =
+					localStats.voteupCount !== voteupCount ||
+					localStats.commentCount !== commentCount ||
+					localStats.collectCount !== collectCount ||
+					localStats.readCount !== readCount;
+
+				if (!hasStatsChanged) {
+					console.log(`[zhihu-loader] 统计数据未变化，跳过写入: ${apiTitle}`);
+					return "SKIPPED";
+				}
+				// 有变化，重新写入文件
+				await vault.modify(file, content);
+			} else {
+				await vault.create(path, content);
+			}
 
 			return "SUCCESS";
 		} catch (error) {

@@ -1,7 +1,7 @@
 {
 	"id": "zhihu-loader",
 	"name": "Zhihu Loader",
-	"version": "2.0.9",
+	"version": "2.0.10",
 	"minAppVersion": "0.15.0",
 	"description": "同步知乎回答与创作者中心问题推荐，助力内容创作。",
 	"author": "tetamao",
