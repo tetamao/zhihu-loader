@@ -1,4 +1,4 @@
-import { Modal, Notice, App } from "obsidian";
+import { Modal, Notice, App, requestUrl } from "obsidian";
 
 // 知乎登录弹窗：创建 BrowserWindow 加载知乎登录页，轮询检测 z_c0 Cookie
 export class ZhihuLoginModal extends Modal {
@@ -146,6 +146,14 @@ export class ZhihuLoginModal extends Modal {
 	private async checkLoginCookie(): Promise<{ success: boolean; cookie?: string; userName?: string; peopleId?: string; avatarUrl?: string }> {
 		try {
 			if (!this.modalWindow || this.modalWindow.isDestroyed()) return { success: false };
+
+			// === 快速路径：cookie 中心检测（优先于 DOM 启发式）===
+			// 解决"弹窗已是登录态、但 URL 停在 /signin，DOM 信号全为未登录特征"导致永远等待扫码的问题。
+			// 只要会话里有 z_c0 就直接读 cookie 并校验，不依赖任何页面 DOM/标题。
+			const sessionLogin = await this.tryReadSessionLogin();
+			if (sessionLogin.success) {
+				return sessionLogin;
+			}
 
 			// ============================================================
 			// 策略：从页面 localStorage 直接读取登录态
@@ -302,8 +310,23 @@ export class ZhihuLoginModal extends Modal {
 				return { success: false };
 			}
 
-			// 有登录态：获取 Cookie 和用户信息
-			// z_c0 是 httpOnly，Electron session.cookies 是唯一可靠获取方式
+			// DOM 信号显示已登录：统一转由会话 cookie 读取与校验（含 z_c0 + /api/v4/me）
+			return await this.tryReadSessionLogin();
+		} catch (e) {
+			console.error("[zhihu-loader] 检测失败:", e);
+			return { success: false };
+		}
+	}
+
+	/**
+	 * 从 Electron session 直接读取知乎登录态（cookie 中心检测）。
+	 * 不依赖任何页面 DOM/标题，只要会话里有 z_c0 即可识别，
+	 * 用于：1) 打开弹窗时已是登录态；2) 扫码后 z_c0 写入 session。
+	 * 校验：用 z_c0 拼 cookie 调 /api/v4/me，通过则视为有效登录。
+	 */
+	private async tryReadSessionLogin(): Promise<{ success: boolean; cookie?: string; userName?: string; peopleId?: string; avatarUrl?: string }> {
+		try {
+			if (!this.modalWindow || this.modalWindow.isDestroyed()) return { success: false };
 			const session = this.modalWindow.webContents.session;
 			const domains = ["zhihu.com", ".zhihu.com", "www.zhihu.com", "link.zhihu.com"];
 			const allCookies: any[] = [];
@@ -313,28 +336,54 @@ export class ZhihuLoginModal extends Modal {
 					if (cookies?.length) allCookies.push(...cookies);
 				} catch (_e) {}
 			}
-
 			// 去重
 			const cookieMap = new Map<string, any>();
 			for (const c of allCookies) cookieMap.set(c.name, c);
 			const uniqueCookies = Array.from(cookieMap.values());
 
-			// 检查 z_c0
 			const z_c0 = uniqueCookies.find((c: any) => c.name === "z_c0");
 			if (!z_c0 || z_c0.value.length < 20) {
-				console.log("[zhihu-loader] 检测到登录但 z_c0 未写入，等待中...");
 				return { success: false };
 			}
 
 			const cookieStr = uniqueCookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
-			const userName = pageState.userName || "知乎用户";
-			const peopleId = pageState.peopleId || "";
-			const avatarUrl = pageState.avatarUrl || "";
 
-			console.log("[zhihu-loader] ✅ 检测到登录态，用户:", userName, "people:", peopleId, "z_c0:", z_c0.value.substring(0, 20) + "...");
+			// 用 /api/v4/me 校验 cookie 是否有效，并拿到可靠的用户信息
+			let userName = "知乎用户";
+			let peopleId = "";
+			let avatarUrl = "";
+		try {
+			// 注意：必须用 Obsidian 的 requestUrl，不能用浏览器 fetch。
+			// 浏览器 fetch 会静默丢弃手动设置的 Cookie 请求头（forbidden header），
+			// 导致 /api/v4/me 收到的是未携带 cookie 的请求 -> 401。
+			// requestUrl 走 node 网络层，可正常携带 Cookie 头（main.ts 同源校验已验证）。
+			const meRes = await requestUrl({
+				url: "https://www.zhihu.com/api/v4/me",
+				method: "GET",
+				headers: {
+					Cookie: cookieStr,
+					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+				},
+			});
+			if (meRes.status >= 200 && meRes.status < 300) {
+				const me: any = meRes.json;
+				userName = me?.name || userName;
+				peopleId = me?.url_token || "";
+				avatarUrl = me?.avatar_url || "";
+			} else {
+				// cookie 实际无效，不返回登录态
+				console.log("[zhihu-loader] z_c0 存在但 /api/v4/me 校验失败:", meRes.status);
+				return { success: false };
+			}
+		} catch (_e) {
+			// 校验请求失败（网络等）：降级信任 z_c0 存在（强登录信号）
+			console.warn("[zhihu-loader] /api/v4/me 校验异常，降级信任 z_c0:", (_e as Error)?.message);
+		}
+
+			console.log("[zhihu-loader] ✅ 会话 cookie 检测到登录态，用户:", userName, "people:", peopleId);
 			return { success: true, cookie: cookieStr, userName, peopleId, avatarUrl };
 		} catch (e) {
-			console.error("[zhihu-loader] 检测失败:", e);
+			console.error("[zhihu-loader] tryReadSessionLogin 失败:", e);
 			return { success: false };
 		}
 	}

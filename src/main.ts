@@ -190,7 +190,7 @@ export default class ZhihuLoaderPlugin extends Plugin {
 		// 清理 creations 缓存
 		this.creationsCache.clear();
 		// 清理 Electron session 中的 zhihu cookie，避免残留登录状态
-		this.clearElectronZhihuCookies();
+		await this.clearElectronZhihuCookies();
 		await this.saveSettings();
 		new Notice("✅ 已注销知乎登录");
 	}
@@ -204,17 +204,28 @@ export default class ZhihuLoaderPlugin extends Plugin {
 			const { remote } = require("electron");
 			const session = remote.session;
 			const domains = ["zhihu.com", ".zhihu.com", "www.zhihu.com", "link.zhihu.com"];
+			let removed = 0;
 			for (const domain of domains) {
 				try {
 					const cookies = await session.cookies.get({ domain });
 					for (const cookie of cookies) {
-						await session.cookies.remove(`https://${cookie.domain || domain}`, cookie.name);
+						// 去掉前导点（.zhihu.com -> zhihu.com），否则 URL 非法导致 remove 静默失败
+						const host = (cookie.domain || domain).replace(/^\./, "");
+						// 按 secure 选协议，失败时换另一种协议重试
+						const proto = cookie.secure ? "https" : "http";
+						try {
+							await session.cookies.remove(`${proto}://${host}`, cookie.name);
+							removed++;
+						} catch (_e) {
+							const alt = proto === "https" ? "http" : "https";
+							await session.cookies.remove(`${alt}://${host}`, cookie.name).catch(() => {});
+						}
 					}
 				} catch (_e) {
 					// ignore
 				}
 			}
-			console.log("[zhihu-loader] 已清除 Electron session 中的 zhihu cookie");
+			console.log(`[zhihu-loader] 已清除 Electron session 中的 zhihu cookie（共 ${removed} 个）`);
 		} catch (_e) {
 			// Electron 不可用时忽略
 		}
